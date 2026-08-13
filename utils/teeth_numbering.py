@@ -87,6 +87,37 @@ _teeth_codes_upper = {
 
 _gum = (0, 'gum')
 
+# Coarse 5-class remap of the 17-class (0-16) scheme: {gum, incisor, canine, premolar, molar}.
+# Position-in-arch is what determines tooth type in this label scheme (see _teeth_codes_lower/
+# upper above), so this mapping is the same regardless of upper/lower arch or L/R side.
+_coarse_class_names = {
+    0: 'gum',
+    1: 'incisor',
+    2: 'canine',
+    3: 'premolar',
+    4: 'molar',
+}
+
+_label_to_coarse_label = {
+    0: 0,                              # gum
+    7: 1, 8: 1, 9: 1, 10: 1,           # incisors (lateral + central, both sides)
+    6: 2, 11: 2,                       # canines
+    4: 3, 5: 3, 12: 3, 13: 3,          # premolars (1st + 2nd, both sides)
+    1: 4, 2: 4, 3: 4, 14: 4, 15: 4, 16: 4,  # molars (1st/2nd/3rd, both sides)
+}
+_coarse_lookup_table = np.array([_label_to_coarse_label[i] for i in range(17)])
+
+# distinct from _teeth_color (which is the model's real 17-class color scheme, used by
+# color_mesh/colors_to_label) - this is only for visually distinguishing the 5 coarse classes.
+_coarse_class_color = {
+    0: (255, 192, 203),  # gum - light pink
+    1: (70, 130, 180),   # incisor - steel blue
+    2: (255, 140, 0),    # canine - dark orange
+    3: (60, 179, 113),   # premolar - medium sea green
+    4: (147, 112, 219),  # molar - medium purple
+}
+_coarse_color_lookup_table = np.array([_coarse_class_color[i] for i in range(5)])
+
 
 
 def color_mesh(mesh: trimesh, labels: np.ndarray) -> trimesh:
@@ -100,6 +131,18 @@ def fdi_to_label(fdi_codes: np.ndarray) -> np.ndarray:
     teeth_codes = {**_teeth_codes_upper, **_teeth_codes_lower}
     labels = itemgetter(*list(fdi_codes))(teeth_codes)
     return np.array([l[0] for l in labels])
+
+
+def label_to_coarse_label(labels: np.ndarray) -> np.ndarray:
+    """Remap the 17-class (0-16) label scheme to the coarse 5-class scheme (see
+    _coarse_class_names): {0: gum, 1: incisor, 2: canine, 3: premolar, 4: molar}."""
+    return _coarse_lookup_table[labels]
+
+
+def coarse_label_to_colors(coarse_labels: np.ndarray) -> np.ndarray:
+    """RGB colors for the coarse 5-class scheme (see _coarse_class_color) - a visualization-only
+    palette distinct from the model's real 17-class _teeth_color scheme."""
+    return _coarse_color_lookup_table[coarse_labels]
 
 
 def label_to_colors(labels: np.ndarray) -> np.ndarray:

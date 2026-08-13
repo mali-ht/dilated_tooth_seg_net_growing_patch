@@ -5,7 +5,10 @@
 .idea
 lightning_logs/
 tensorboard_logs/
+checkpoints/
 logs/
+.vscode/
+9_DilatedToothSegNet_*.pdf
 data/*
 *.npz
 *.ipynb
@@ -14,6 +17,7 @@ experiment_config/
 *.stl
 *.obj
 *.exports
+*.png
 pointnet2_ops_lib/build
 pointnet2_ops_lib/dist
 *.egg-info/

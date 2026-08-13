@@ -63,25 +63,16 @@ In the feature builder (currently `PreTransform`):
   with the live pipeline.
 
 ## Component 4 — Model surgery (`models/layer.py`, `models/dilated_tooth_seg_network.py`)
-- **Norm layers:** replace all `BatchNorm` with `GroupNorm` (or `LayerNorm`) so normalization is per-point
-  and independent of batch/patch composition.
+- **Norm layers:** replace all `BatchNorm` with `GroupNorm` (or `LayerNorm`) so normalization is per-point and independent of batch/patch composition.
 - **STN:** remove `STNkd` (the Spatial Transformer / T-Net) from the forward path.
-- **Variable N:** remove the pad/resample-to-16,000 assumption; support variable face count per sample.
-  Batch via `batch_size=1`, or masked padding / size-bucketing for larger batches — masked points must be
-  excluded from kNN, FPS, pooling, and loss.
-- **Area-gated dilation:** make the three dilated blocks engage based on the patch's accumulated **area in
-  mm²** (thresholds ~40 / ~180 / ~360 mm² for blocks 1/2/3). Below a block's threshold, bypass it while
-  keeping the concatenation into `global_hidden_layer` valid (e.g. pass the identity/zero-filled
-  contribution so channel counts stay fixed). Make thresholds and block count config-driven.
+- **Variable N:** remove the pad/resample-to-16,000 assumption; support variable face count per sample. Batch via `batch_size=1`, or masked padding / size-bucketing for larger batches — masked points must beexcluded from kNN, FPS, pooling, and loss.
+- **Area-gated dilation:** make the three dilated blocks engage based on the patch's accumulated **area in mm²** (thresholds ~40 / ~180 / ~360 mm² for blocks 1/2/3). Below a block's threshold, bypass it while keeping the concatenation into `global_hidden_layer` valid (e.g. pass the identity/zero-filled contribution so channel counts stay fixed). Make thresholds and block count config-driven.
 - Parameterize `num_classes` everywhere (network, Lightning module, torchmetrics) — currently hard-coded 17.
 
 ## Component 5 — Loss, metrics, experiment matrix
-- **Loss:** class-weighted cross-entropy (inverse-frequency) or focal loss (config flag), to handle the
-  varying gum/tooth ratio across patches.
-- **Metrics:** patch-aware — ignore classes absent from a patch when computing mIoU; log per-class where
-  possible; add a boundary/edge accuracy metric if easy.
-- **Experiment flags** (config/CLI): `num_classes ∈ {17,5}`, `dilation_gating ∈ {on, off}`, norm scheme.
-  I want to run and compare these.
+- **Loss:** class-weighted cross-entropy (inverse-frequency) or focal loss (config flag), to handle the varying gum/tooth ratio across patches.
+- **Metrics:** patch-aware — ignore classes absent from a patch when computing mIoU; log per-class where possible; add a boundary/edge accuracy metric if easy.
+- **Experiment flags** (config/CLI): `num_classes ∈ {17,5}`, `dilation_gating ∈ {on, off}`, norm scheme. I want to run and compare these.
 
 ## Deliverables
 - New branch, modular config-driven changes, existing full-arch path preserved behind a flag.

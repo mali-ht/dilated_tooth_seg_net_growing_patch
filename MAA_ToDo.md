@@ -79,6 +79,8 @@ Two axes of partialness + supporting pieces:
 6.  [ ] Patch generator: extent axis (anterior seed, continuous area growth) — design mostly done.
 7.  [ ] Patch generator: coverage axis (occlusal-first via face-normal alignment) — NEXT.
 8.  [ ] Dilation curriculum gated in mm² (40/180/360); keep global_hidden_layer concat valid when on/off.
+    NOTE: gating alone doesn't fix the O(N²) cdist cost (computed upfront regardless of gating) -
+    see TRAINING_CONCERNS.md #1, blocking for large (40k+ face) patches.
 9.  [ ] Variable-N pipeline: drop pad/resample-to-16,000; simplify to fixed DENSITY.
 10. [ ] Patch-invariant normalization: fixed mm scale; normals raw; identical train & infer.
 11. [ ] Replace BatchNorm → GroupNorm/LayerNorm.
@@ -96,8 +98,14 @@ Two axes of partialness + supporting pieces:
 ## Open design questions
 - Frida hook for the DLL's WHOLE unified mesh at once (vs reassembling tiles)?
 - Coverage axis: independent (E,c) sampling vs ordered occlusal-sweep-then-sides trajectories?
+  See TRAINING_CONCERNS.md #3 - built the ordered occlusal->facial->lingual trajectory, but it's
+  a hypothesis (robot policy not finalized), mitigated by training on randomized/broad patches.
 - Dilation gating mechanism: single tolerant net vs two heads vs always-on-trained-to-ignore.
 - Seg+controller cadence: every N snapshots? per +X mm²? on demand?
+
+See TRAINING_CONCERNS.md for a fuller design-review pass (Aug 2026) covering the cdist bottleneck,
+training batch structure, curriculum-vs-real-policy risk, facial/lingual contribution, and
+confirmed priorities (loss weighting, sim-to-real augmentation) before training starts.
 
 ## Toward the Claude Code prompt (later)
 Collect: Path B + arch-assembly method, patch-generator spec, repo files/classes to change,

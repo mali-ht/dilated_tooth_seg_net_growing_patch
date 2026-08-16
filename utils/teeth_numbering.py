@@ -133,6 +133,48 @@ def fdi_to_label(fdi_codes: np.ndarray) -> np.ndarray:
     return np.array([l[0] for l in labels])
 
 
+# Standard FDI -> Universal Numbering System (1-32) conversion, verified against known reference
+# points (FDI 11 = Universal 8, upper right central incisor; FDI 48 = Universal 32, lower right
+# 3rd molar). Independent of this codebase's internal label scheme - a fixed dental-notation fact.
+_UNIVERSAL_FROM_FDI = {}
+for _pos in range(1, 9):
+    _UNIVERSAL_FROM_FDI[10 + _pos] = 9 - _pos    # FDI quadrant 1 -> Universal 8..1
+    _UNIVERSAL_FROM_FDI[20 + _pos] = 8 + _pos    # FDI quadrant 2 -> Universal 9..16
+    _UNIVERSAL_FROM_FDI[30 + _pos] = 25 - _pos   # FDI quadrant 3 -> Universal 24..17
+    _UNIVERSAL_FROM_FDI[40 + _pos] = 24 + _pos   # FDI quadrant 4 -> Universal 25..32
+del _pos
+
+
+def label_to_universal_number(labels: np.ndarray, arch: str) -> np.ndarray:
+    """Internal 1-16 label (0=gum) -> Universal Numbering System (1-32). Needs an explicit `arch`
+    ('upper' or 'lower') because the internal label scheme mirrors L/R only, not upper/lower (see
+    _teeth_codes_lower/_teeth_codes_upper - the SAME internal label means different real teeth on
+    the two arches) - there's no way to recover which arch a label came from from the label alone.
+    Returns 0 for gum (a sentinel; real Universal numbers are 1-32, never 0).
+
+    This assumes the same patient left/right orientation convention the training data (Teeth3DS,
+    via _teeth_codes_lower/_teeth_codes_upper's own FDI codes) used. Verify against a known
+    ground-truth example before relying on this for anything beyond a live visual aid.
+
+    NOTE: _teeth_codes_lower/_teeth_codes_upper are named backwards relative to what they
+    actually contain - confirmed directly against a real Teeth3DS *_lower.json label file, whose
+    FDI codes (31-47, quadrants 3&4 - real mandibular/lower per the FDI standard) match
+    _teeth_codes_UPPER's keys, not _teeth_codes_lower's (11-28, quadrants 1&2 - real maxillary/
+    upper). This never mattered before: fdi_to_label merges both dicts into one combined lookup
+    (their key sets are disjoint) and never needed to pick one specifically. Left the original
+    dict names alone (part of the reference implementation, and fdi_to_label's merge is correct
+    regardless of the naming) - just selecting the right one here.
+    """
+    if arch not in ('upper', 'lower'):
+        raise ValueError(f"arch must be 'upper' or 'lower', not {arch!r}")
+    codes = _teeth_codes_upper if arch == 'lower' else _teeth_codes_lower
+    label_to_fdi = {internal_label: fdi for fdi, (internal_label, _name) in codes.items()}
+    lookup = np.zeros(17, dtype=np.int64)
+    for internal_label, fdi in label_to_fdi.items():
+        lookup[internal_label] = _UNIVERSAL_FROM_FDI.get(fdi, 0)
+    return lookup[labels]
+
+
 def label_to_coarse_label(labels: np.ndarray) -> np.ndarray:
     """Remap the 17-class (0-16) label scheme to the coarse 5-class scheme (see
     _coarse_class_names): {0: gum, 1: incisor, 2: canine, 3: premolar, 4: molar}."""

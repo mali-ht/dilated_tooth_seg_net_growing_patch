@@ -84,7 +84,7 @@ def main(root, device):
     # knn()/get_graph_feature's calling convention passes pos already transposed to (B, 3, N) -
     # see EdgeGraphConvBlock.forward's pos_t = pos.transpose(2, 1) before it reaches knn()
     onfly_idx = clamped_knn(pos_cpu.transpose(2, 1), k=32)[0].numpy()
-    local_idx, _ = precompute_neighbor_indices(pos_np, k=32, dilation_ks=(200, 600, 1800), rng=rng)
+    local_idx, _ = precompute_neighbor_indices(pos_np, k=32, dilation_ks=(200, 900, 1800), rng=rng)
     match = sum(set(onfly_idx[i].tolist()) == set(local_idx[i].tolist()) for i in range(n))
     print(f"  {match}/{n} faces: precomputed KD-tree neighbor SET exactly matches on-the-fly cdist+topk")
     assert match == n, "KD-tree and brute-force cdist should find the exact same k-nearest set (both exact)"
@@ -93,7 +93,7 @@ def main(root, device):
     print("=== precomputed idx vs on-the-fly: dilated blocks' CANDIDATE POOL matches (pre-FPS) ===")
     from models.patch_layer import DilatedEdgeGraphConvBlock
     cd = torch.cdist(pos_cpu, pos_cpu, p=2)
-    for dk in (200, 600, 1800):
+    for dk in (200, 900, 1800):
         onfly_cand = torch.topk(cd, min(dk, n), largest=False)[1][0].numpy()
         onfly_sets = [set(row.tolist()) for row in onfly_cand]
         _, dilated_all = precompute_neighbor_indices(pos_np, k=32, dilation_ks=(dk,), rng=rng)

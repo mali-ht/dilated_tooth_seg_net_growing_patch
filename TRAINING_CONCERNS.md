@@ -43,8 +43,18 @@ succeeds for N=33 and above, fails for N=32, 24, 10. This is not a tail-case ris
 `early_bias_power` is to bias toward exactly these small/early patches), so the unmodified model
 would crash on a meaningful fraction of real training draws. `DilatedEdgeGraphConvBlock` already
 guards its OWN dilation neighborhood with `dilation_k = min(self.dilation_k, N)`, so the fixed
-`dilation_k` values (200/600/1800 - tuned for the paper's fixed N=16,000 setting) degrade
-gracefully on small N; `EdgeGraphConvBlock`'s plain `k=32` has no equivalent guard.
+`dilation_k` values (200/900/1800 - the paper's own values, from its fixed N=16,000 setting)
+degrade gracefully on small N; `EdgeGraphConvBlock`'s plain `k=32` has no equivalent guard.
+
+**Correction (later session, see REALTIME.md):** this line previously read "200/600/1800 -
+tuned for the paper's fixed N=16,000 setting" - factually wrong. The actual paper/reference file
+(`models/dilated_tooth_seg_network.py:31-39`, untouched) uses 900 for the middle dilated block,
+not 600. 600 had silently become the default in `models/patch_dilated_tooth_seg_network.py` (and
+propagated into `patch_lightning_module.py`/`patch_collate.py`'s defaults) with no design
+rationale anywhere in this project's docs - `claude_code_prompt.md`'s Component 4 spec never asked
+for a dilation_k change, only norm/STN/variable-N/area-gating - and this very line then
+misdescribed that drift as intentional. Restored to 900 everywhere; this line corrected rather
+than left showing the wrong value it was itself part of propagating.
 
 **Status: RESOLVED as part of Component 4.** Both problems fixed:
 

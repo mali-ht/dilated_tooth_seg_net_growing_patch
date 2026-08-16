@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass
 
 import numba
@@ -42,6 +43,30 @@ from scipy.spatial import cKDTree
 # N=5083, m=1800, k=32; 0.18s vs an extrapolated ~18s at N=25000). numba is a pure CPU JIT
 # compiler (LLVM, compiled for whatever CPU it runs on) - unlike torch_cluster, there's no CUDA
 # architecture/wheel-compatibility risk, and it was already present in this environment.
+
+
+@numba.njit(parallel=True, cache=True)
+def _gather_candidate_positions_numba(pos_np, cand_idx_all):
+    """pos_np: (total_N, 3) float32 - every face's position, the same array cKDTree was built on.
+    cand_idx_all: (N, max_k) int64 - each row is one face's candidate neighbor indices, ascending
+    distance. Returns (N, max_k, 3) float32: cand_idx_all's indices resolved to actual positions.
+
+    Same gather plain numpy already did (pos_np[cand_idx_all]) - added because profiling a live
+    cycle (REALTIME.md) found it was the single largest cost in the whole pipeline (bigger than
+    the model's entire forward pass), and it was running single-threaded: numpy fancy indexing
+    isn't itself multi-threaded. The KD-tree query right before this already needed workers=-1 for
+    the identical reason (this file's own comment: "~4.3s single-threaded vs ~0.3s parallel"); this
+    is the same fix applied to the next line's gather, following models.layer.fps's C-order-loop
+    style and numba.prange like _fps_batched_numba below already does for the FPS step itself."""
+    n, m = cand_idx_all.shape
+    out = np.empty((n, m, 3), dtype=np.float32)
+    for i in numba.prange(n):
+        for j in range(m):
+            idx = cand_idx_all[i, j]
+            out[i, j, 0] = pos_np[idx, 0]
+            out[i, j, 1] = pos_np[idx, 1]
+            out[i, j, 2] = pos_np[idx, 2]
+    return out
 
 
 @numba.njit(parallel=True, cache=True)
@@ -90,7 +115,7 @@ def _fps_batched(points, k, rng):
     return _fps_batched_numba(points, k, farthest0)
 
 
-def precompute_neighbor_indices(pos_np, k, dilation_ks, rng):
+def precompute_neighbor_indices(pos_np, k, dilation_ks, rng, profile=False):
     """
     One KD-tree build + one query, sliced to serve block 1's local kNN and all len(dilation_ks)
     dilated blocks' candidate-gather-then-FPS. Returns (local_idx, dilated_idx_list):
@@ -99,25 +124,66 @@ def precompute_neighbor_indices(pos_np, k, dilation_ks, rng):
         candidate pool before FPS (matches DilatedEdgeGraphConvBlock's on-the-fly
         torch.topk(cd, dilation_k) call, which has no self-exclusion, unlike the local blocks)
     k_eff / fps_k_eff are the usual min(..., N)-style clamps for small patches.
+
+    profile=False (default, used by training's PatchCollator.__call__) returns the usual 2-tuple
+    with no overhead. profile=True (live-inference debug investigation only, see REALTIME.md)
+    additionally returns a per-stage timing dict as a third element - kdtree build vs. query vs.
+    each dilation level's FPS pass, so a slow collate step can be attributed to a specific stage
+    instead of just the single bundled t_collate number LiveSegmenter already tracked.
     """
+    timings = {} if profile else None
     n = pos_np.shape[0]
     max_k = min(max(k, max(dilation_ks)), n)
+
+    t0 = time.time()
     tree = cKDTree(pos_np)
+    if profile:
+        timings['kdtree_build'] = time.time() - t0
+
     # workers=-1: use all CPU cores - single-threaded query was the dominant cost by far (~4.3s
     # vs ~0.3s parallel, measured on a 24-core machine for a 29k-face patch at k=1800)
+    t0 = time.time()
     _, cand_idx_all = tree.query(pos_np, k=max_k, workers=-1)
-    cand_idx_all = np.atleast_2d(cand_idx_all).astype(np.int64)  # (N, max_k), ascending distance
-    cand_pos_all = pos_np[cand_idx_all].astype(np.float32)  # (N, max_k, 3)
+    if profile:
+        timings['kdtree_query'] = time.time() - t0
+
+    # cand_pos_all materializes an (N, max_k, 3) float32 array - at N~17k, max_k~1800 that's
+    # ~370MB. Timed separately from kdtree_query above: a first profiling pass left this untimed
+    # and the numbers didn't add up (t_collate noticeably bigger than kdtree_query + all FPS
+    # stages combined) - this gather is where the rest of it was, and it turned out to be the
+    # single largest cost in the whole live-inference cycle (see REALTIME.md) - bigger than the
+    # model's entire forward pass. Two fixes, both verified live in that profiling pass:
+    #   1. copy=False on both astype calls (not the plain .astype(dtype) used elsewhere in this
+    #      file, which always copies even when the dtype already matches): pos_np is a torch
+    #      tensor's .numpy() view of PatchPreTransform's `torch.zeros(s, 24).float()` output, so
+    #      it's already float32 - the original .astype(np.float32) was silently doing a SECOND
+    #      full-array copy of this exact 370MB result for nothing (cKDTree.query's index dtype,
+    #      np.intp, is likewise already int64 on this platform). This alone roughly halved the
+    #      cost.
+    #   2. The actual gather now runs through _gather_candidate_positions_numba (parallel via
+    #      numba.prange) instead of plain numpy fancy indexing (single-threaded) - same fix this
+    #      file's own kdtree_query already needed (see its comment) applied one line later.
+    t0 = time.time()
+    cand_idx_all = np.atleast_2d(cand_idx_all).astype(np.int64, copy=False)  # (N, max_k), ascending distance
+    cand_pos_all = _gather_candidate_positions_numba(pos_np.astype(np.float32, copy=False), cand_idx_all)
+    if profile:
+        timings['candidate_gather'] = time.time() - t0
 
     k_eff = max(0, min(k, n - 1))
     local_idx = cand_idx_all[:, 1:k_eff + 1]  # drop self (column 0, distance 0)
 
     dilated_idx = []
-    for dk in dilation_ks:
+    for i, dk in enumerate(dilation_ks):
         dk_eff = min(dk, n)
         fps_k_eff = min(k, dk_eff)
+        t0 = time.time()
         local_sel = _fps_batched(cand_pos_all[:, :dk_eff], fps_k_eff, rng)  # (N, fps_k_eff)
+        if profile:
+            timings[f'fps_dilation{i}_k{dk}'] = time.time() - t0
         dilated_idx.append(np.take_along_axis(cand_idx_all[:, :dk_eff], local_sel, axis=1))
+
+    if profile:
+        return local_idx, dilated_idx, timings
     return local_idx, dilated_idx
 
 
@@ -163,7 +229,7 @@ class PatchCollator:
     silently drift apart.
     """
 
-    def __init__(self, k=32, dilation_ks=(200, 600, 1800), seed=None):
+    def __init__(self, k=32, dilation_ks=(200, 900, 1800), seed=None):
         self.k = k
         self.dilation_ks = tuple(dilation_ks)
         self.seed = seed

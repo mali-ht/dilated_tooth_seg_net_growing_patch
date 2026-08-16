@@ -26,7 +26,7 @@ from models.patch_dilated_tooth_seg_network import PatchDilatedToothSegmentation
 
 class PatchLitDilatedToothSegmentationNetwork(L.LightningModule):
     def __init__(self, num_classes: int = 17, feature_dim: int = 24, k: int = 32,
-                 dilation_ks=(200, 600, 1800), area_thresholds=(40.0, 180.0, 360.0),
+                 dilation_ks=(200, 900, 1800), area_thresholds=(40.0, 180.0, 360.0),
                  dilation_gating: bool = True, focal_gamma: float = 2.0, class_alpha=None,
                  lr: float = 1e-3, weight_decay: float = 1e-5, lr_step_size: int = 60,
                  lr_gamma: float = 0.5):

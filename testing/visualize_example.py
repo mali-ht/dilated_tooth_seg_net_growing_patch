@@ -1,16 +1,21 @@
 import argparse
+import os
 import random
+import sys
 import numpy as np
-from pathlib import Path 
+from pathlib import Path
 import trimesh
-from utils.teeth_numbering import color_mesh
 
-from lightning.pytorch import seed_everything
-from torch.utils.data.dataset import Dataset
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root -
+# same pattern as testing/test_patch_model.py and the other testing/*.py scripts
+from utils.teeth_numbering import color_mesh  # noqa: E402
 
-from dataset.mesh_dataset import Teeth3DSDataset
-from dataset.preprocessing import *
-from models.dilated_tooth_seg_network import LitDilatedToothSegmentationNetwork
+from lightning.pytorch import seed_everything  # noqa: E402
+from torch.utils.data.dataset import Dataset  # noqa: E402
+
+from dataset.mesh_dataset import Teeth3DSDataset  # noqa: E402
+from dataset.preprocessing import *  # noqa: E402,F403
+from models.dilated_tooth_seg_network import LitDilatedToothSegmentationNetwork  # noqa: E402
 
 SEED = 42
 torch.manual_seed(SEED)

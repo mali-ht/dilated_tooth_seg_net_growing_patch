@@ -1,15 +1,18 @@
 import argparse
 import csv
 import os
+import sys
 
 import numpy as np
 import torch
 
-from dataset.patch_dataset import PatchTeeth3DSDataset
-from dataset.patch_preprocessing import PatchPreTransform
-from dataset.patch_preprocessing_color import PatchPreTransformWithColor
-from models.patch_collate import PatchCollator
-from models.patch_lightning_module import PatchLitDilatedToothSegmentationNetwork
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root -
+# same pattern as testing/test_patch_model.py and the other testing/*.py scripts
+from dataset.patch_dataset import PatchTeeth3DSDataset  # noqa: E402
+from dataset.patch_preprocessing import PatchPreTransform  # noqa: E402
+from dataset.patch_preprocessing_color import PatchPreTransformWithColor  # noqa: E402
+from models.patch_collate import PatchCollator  # noqa: E402
+from models.patch_lightning_module import PatchLitDilatedToothSegmentationNetwork  # noqa: E402
 
 # New, additive-only script (nothing under dataset/ or models/ is modified) - a fast, no-retrain
 # way to check whether different area_thresholds gate values look promising BEFORE committing

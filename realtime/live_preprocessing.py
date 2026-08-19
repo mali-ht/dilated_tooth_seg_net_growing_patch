@@ -26,7 +26,7 @@ def _debug(msg):
 # neighbors are otherwise about.
 NO_COLOR_SENTINEL = np.array([102, 102, 102], dtype=np.uint8)
 
-# Bridges the live mesh_wire stream (testing/realtime/mesh_wire.py, untouched) to the trained
+# Bridges the live mesh_wire stream (realtime/mesh_wire.py, untouched) to the trained
 # patch model. Two problems solved here, neither handled anywhere else in the pipeline:
 #
 # 1. Density mismatch: claude_code_prompt.md measured the live scanner's native density at
@@ -140,7 +140,7 @@ def spatial_split(vertices: np.ndarray, faces: np.ndarray, n_splits: int, colors
 
     Spatially-coherent splits, not a random face subset: this project's own earlier testing found
     a random subset fragments badly under pyfqmr's decimator (see downsample_to_density's
-    docstring and testing/realtime/test_live_segmenter.py's _spatial_chunks, which this mirrors).
+    docstring and realtime/test_live_segmenter.py's _spatial_chunks, which this mirrors).
 
     colors: optional (V, 3) uint8 RGB matching vertices - sliced by the same used_v index as
     vertices so each piece's colors line up with its own local vertex indexing.
@@ -237,7 +237,7 @@ def voxel_size_for_density(target_density: float, fineness: float = 0.3) -> floa
     of a single, non-overlapping chunk's faces for no reason. `fineness` scales the grid down well
     below that natural spacing (default 0.3x) so real neighbors stay distinguishable, while still
     being coarse enough to catch TRUE redundant re-observations (different chunks landing on
-    close to the same physical point) - see testing/realtime/test_live_segmenter.py for both
+    close to the same physical point) - see realtime/test_live_segmenter.py for both
     properties verified together (single-chunk density preserved AND synthetic overlap removed)."""
     return fineness / (target_density ** 0.5)
 

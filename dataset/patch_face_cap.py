@@ -18,7 +18,7 @@ import torch
 # training (confirmed - nothing in that file bounds N). An occasional very large patch (late-
 # stage/full-arch growth stages) makes that single kernel run long enough to trip the watchdog.
 # Live inference already hit this exact same O(N^2) concern and fixed it with
-# cap_face_count/max_model_faces=20000 (testing/realtime/mesh_viewer_segmented.py) - this reuses
+# cap_face_count/max_model_faces=20000 (realtime/mesh_viewer_segmented.py) - this reuses
 # that same default value, both to stop the crash and to keep train/inference face-count
 # distributions consistent with each other.
 

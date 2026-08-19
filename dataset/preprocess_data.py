@@ -1,6 +1,12 @@
 import argparse
+import os
+import sys
 
-from dataset.mesh_dataset import Teeth3DSDataset
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root -
+# needed even though this file now lives inside dataset/ itself: the import below is the
+# absolute `dataset.mesh_dataset` form (unchanged, not switched to a bare sibling import), which
+# needs the project ROOT on sys.path, not dataset/ itself - same pattern as testing/*.py's scripts
+from dataset.mesh_dataset import Teeth3DSDataset  # noqa: E402
 
 CACHE_CONFIGS = {
     "capped16k": dict(processed_folder="processed_capped16k", target_density=5.0, max_target_count=16000),

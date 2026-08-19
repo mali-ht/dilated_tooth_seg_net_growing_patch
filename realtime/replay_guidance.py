@@ -1,21 +1,18 @@
 import argparse
 import glob
 import os
-import sys
 
 import numpy as np
 
-# mesh_viewer_segmented.py does `import mesh_wire` as a bare (non-package-relative) import,
-# assuming testing/realtime/ is already on sys.path (true when run as a script from there, not
-# true here) - added explicitly rather than duplicating update_guidance_confirmation, so this
-# actually replays the real code path LiveSegmenter runs, not a maybe-drifted copy of it.
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "testing", "realtime"))
-
-from testing.realtime.mesh_viewer_segmented import (_GUIDANCE_LEFT_SEQUENCE, _GUIDANCE_RIGHT_SEQUENCE,  # noqa: E402
-                                                      update_guidance_confirmation)
+# mesh_viewer_segmented.py is a sibling in this same realtime/ directory - bare import (this file
+# moved from repo root into realtime/ alongside it, so no sys.path hack is needed anymore: running
+# this directly auto-adds realtime/ to sys.path, same as mesh_viewer_segmented.py's own bare
+# `import mesh_wire`/`from debug_log import logger`). Imported (not reimplemented) so this actually
+# replays the real code path LiveSegmenter runs, not a maybe-drifted copy of it.
+from mesh_viewer_segmented import _GUIDANCE_LEFT_SEQUENCE, _GUIDANCE_RIGHT_SEQUENCE, update_guidance_confirmation
 
 # New, additive-only script - replays a SAVED live-hardware run's real per-cycle predictions
-# (testing/realtime/mesh_viewer_segmented.py's snapshots) through the OLD (stateless, single-cycle
+# (realtime/mesh_viewer_segmented.py's snapshots) through the OLD (stateless, single-cycle
 # threshold crossing) vs NEW (Finding #13, REALTIME.md - sustained multi-cycle confirmation)
 # guidance-confirmation logic side by side, to validate the fix against real data BEFORE trusting
 # it on live hardware. Reuses the actual update_guidance_confirmation function (imported, not
@@ -59,10 +56,10 @@ def regimen_target(confirmed):
 def main():
     parser = argparse.ArgumentParser(description="Replay OLD vs NEW (Finding #13) guidance confirmation "
                                                    "logic against a saved live-hardware run")
-    parser.add_argument("run_dir", help="testing/logs/snapshots/<run_id>/ directory")
+    parser.add_argument("run_dir", help="realtime/logs/snapshots/<run_id>/ directory")
     parser.add_argument("--min_faces", type=int, default=30)
     parser.add_argument("--confirm_cycles", type=int, default=8,
-                         help="must match testing/realtime/mesh_viewer_segmented.py's "
+                         help="must match realtime/mesh_viewer_segmented.py's "
                               "LiveSegmenter guidance_confirm_cycles default (8) to replay what a "
                               "live run would actually do - override to test a candidate value "
                               "before changing that default")

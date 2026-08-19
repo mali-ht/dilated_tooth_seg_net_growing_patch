@@ -27,7 +27,9 @@ import numpy as np
 
 import mesh_wire
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root -
+# this file moved from testing/realtime/ to realtime/ (one level shallower), so this now only
+# needs to strip 2 path components (file -> realtime -> root), not 3
 from dataset.patch_generator import load_cached_arch  # noqa: E402
 
 

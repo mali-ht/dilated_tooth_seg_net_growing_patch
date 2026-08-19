@@ -87,7 +87,7 @@ if __name__ == "__main__":
                          help='Disable automatic inverse-frequency FocalLoss weighting (on by default)')
     parser.add_argument('--class_alpha_samples', type=int, default=200,
                          help='How many patches to sample when measuring class frequency for FocalLoss alpha')
-    parser.add_argument('--tb_save_dir', type=str, default='tensorboard_logs')
+    parser.add_argument('--tb_save_dir', type=str, default='logs/tensorboard')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
                          help='Where model checkpoints (.ckpt) are saved - kept separate from '
                               '--tb_save_dir so logs and (large) checkpoint files do not mix')

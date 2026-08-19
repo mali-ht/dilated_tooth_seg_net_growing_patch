@@ -929,9 +929,16 @@ top of a real, unresolved accuracy gap, not a substitute for closing it.
 
 ## How to run it
 
+**2026-08-19: the whole realtime subsystem moved from `testing/realtime/` to a top-level
+`realtime/` directory** (including its output logs/snapshots, now `realtime/logs/` instead of
+`testing/logs/`) - it earned its own place in the repo rather than living under `testing/`. The
+Finding write-ups above still say `testing/realtime/...` in places since they're a chronological
+record of what was true when each was written; only the commands below (and the code itself) were
+updated.
+
 Against real hardware, single viewer (the common case):
 ```bash
-python3 testing/realtime/mesh_viewer_segmented.py \
+python3 realtime/mesh_viewer_segmented.py \
   --host <WINDOWS_SERVER_IP> \
   --ckpt <path to a .ckpt> \
   --arch <upper|lower>
@@ -947,21 +954,21 @@ vs. a candidate `--confirm_cycles` value, respectively.
 
 Against real hardware, both viewers at once:
 ```bash
-python3 testing/realtime/mesh_relay.py --host <WINDOWS_SERVER_IP>
-python3 testing/realtime/mesh_viewer_linux.py --host 127.0.0.1 --port 8780
-python3 testing/realtime/mesh_viewer_segmented.py --host 127.0.0.1 --port 8780 --ckpt <path> --arch <upper|lower>
+python3 realtime/mesh_relay.py --host <WINDOWS_SERVER_IP>
+python3 realtime/mesh_viewer_linux.py --host 127.0.0.1 --port 8780
+python3 realtime/mesh_viewer_segmented.py --host 127.0.0.1 --port 8780 --ckpt <path> --arch <upper|lower>
 ```
 
 Offline, no real hardware needed:
 ```bash
-python3 testing/realtime/fake_mesh_server.py --pt_path <a processed_w5 cache file> --port 18770
-python3 testing/realtime/mesh_relay.py --host 127.0.0.1 --port 18770 --local_port 18780
+python3 realtime/fake_mesh_server.py --pt_path <a processed_w5 cache file> --port 18770
+python3 realtime/mesh_relay.py --host 127.0.0.1 --port 18770 --local_port 18780
 # then either viewer, pointed at 127.0.0.1:18780
 ```
 
 Headless pipeline test (no sockets, no GUI, no real hardware):
 ```bash
-python3 testing/realtime/test_live_segmenter.py --ckpt <path to a .ckpt>
+python3 realtime/test_live_segmenter.py --ckpt <path to a .ckpt>
 ```
 
 ## Not yet done / open items for whoever picks this up next

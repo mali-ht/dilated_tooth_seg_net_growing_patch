@@ -1,18 +1,21 @@
 import argparse
 import glob
 import os
+import sys
 
 import numpy as np
 
-from dataset.patch_color_augmentation import GUM_RGB_HIGH, GUM_RGB_LOW, TOOTH_RGB_HIGH, TOOTH_RGB_LOW
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root -
+# this file lives in realtime/ (one level below root), same pattern testing/*.py already uses
+from dataset.patch_color_augmentation import GUM_RGB_HIGH, GUM_RGB_LOW, TOOTH_RGB_HIGH, TOOTH_RGB_LOW  # noqa: E402
 
-# Same value as testing/realtime/live_preprocessing.py's NO_COLOR_SENTINEL - inlined rather than
+# Same value as realtime/live_preprocessing.py's NO_COLOR_SENTINEL - inlined rather than
 # imported to avoid that module's own sys.path dependency on being run from within
-# testing/realtime/ (it does `from debug_log import logger`, a bare import that only resolves
+# realtime/ (it does `from debug_log import logger`, a bare import that only resolves
 # with that directory already on sys.path).
 NO_COLOR_SENTINEL = np.array([102, 102, 102], dtype=np.int64)
 
-# New, additive-only script - reads real captured color out of testing/realtime/mesh_viewer_
+# New, additive-only script - reads real captured color out of realtime/mesh_viewer_
 # segmented.py's snapshot .npz files (face_colors, added 2026-08-19 specifically for this) across
 # one or more live-hardware runs, and reports per-channel mean/std/min/max for teeth vs. gum,
 # directly comparable against dataset/patch_color_augmentation.py's TOOTH_RGB_LOW/HIGH and
@@ -33,7 +36,7 @@ NO_COLOR_SENTINEL = np.array([102, 102, 102], dtype=np.int64)
 # struggling badly.
 #
 # Sentinel-contaminated faces (NO_COLOR_SENTINEL - a real bug fixed 2026-08-19, see
-# testing/realtime/live_preprocessing.py's merge_meshes docstring: chunks the wire protocol sent
+# realtime/live_preprocessing.py's merge_meshes docstring: chunks the wire protocol sent
 # with no color data at all) are excluded entirely - they are not real captured color and would
 # just add a spurious [102,102,102] spike to both buckets.
 
@@ -80,7 +83,7 @@ def main():
                      "via the model's OWN predictions (no ground truth exists for real hardware data - "
                      "see this file's own module docstring for that caveat)")
     parser.add_argument("run_dirs", nargs="+",
-                         help="one or more testing/logs/snapshots/<run_id>/ directories")
+                         help="one or more realtime/logs/snapshots/<run_id>/ directories")
     args = parser.parse_args()
 
     all_colors, all_labels = [], []

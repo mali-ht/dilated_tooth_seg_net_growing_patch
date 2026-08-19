@@ -100,14 +100,14 @@ python train_network.py --epochs 100 --tb_save_dir logs --experiment_name traini
 
 To see the training progress, you can use TensorBoard by running the following command in the terminal:
 ```bash
-tensorboard --logdir <path_to_tensorboard_logs> --port 6006 --host 0.0.0.0
+tensorboard --logdir <path_to_logs>/tensorboard --port 6006 --host 0.0.0.0
 ```
 Then open a browser and navigate to http://localhost:6006
 
 Options:
 
 ```--epochs <number>```: The number of epochs to train for. Default is 100. <br>
-```--tb_save_dir <path>```: The directory to save TensorBoard logs to. Default is tensorboard_logs. <br>
+```--tb_save_dir <path>```: The directory to save TensorBoard logs to. Default is logs/tensorboard. <br>
 ```--devices <devices>```: The device ids to use for training. If multiple devices are used, they should be separated by space (e.g 0 1 2). Default is 0. <br>
 ```--experiment_name <name>```: The name of the experiment. <br>
 ```--experiment_version <version>```: The version of the experiment. <br>

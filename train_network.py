@@ -52,7 +52,7 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int,
                         help='How many epochs to train', default=100)
     parser.add_argument('--tb_save_dir', type=str,
-                        help='Tensorboard save directory', default='tensorboard_logs')
+                        help='Tensorboard save directory', default='logs/tensorboard')
     parser.add_argument('--experiment_name', type=str,
                         help='Experiment Name')
     parser.add_argument('--experiment_version', type=str,

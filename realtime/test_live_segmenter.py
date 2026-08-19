@@ -6,10 +6,12 @@ import numpy as np
 import torch
 import trimesh
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root -
+# this file moved from testing/realtime/ to realtime/ (one level shallower), so this now only
+# needs to strip 2 path components (file -> realtime -> root), not 3
 
 from models.patch_lightning_module import PatchLitDilatedToothSegmentationNetwork  # noqa: E402
-from testing.realtime.mesh_viewer_segmented import LiveSegmenter, colors_for_predictions, flat_shaded_mesh  # noqa: E402
+from realtime.mesh_viewer_segmented import LiveSegmenter, colors_for_predictions, flat_shaded_mesh  # noqa: E402
 
 # Headless test of the actual live-inference pipeline - no Open3D window, no network, no real
 # scanner - so this can run in this environment despite having neither the real hardware nor a

@@ -4,10 +4,8 @@
 .ipynb_checkpoints
 .idea
 lightning_logs/
-tensorboard_logs/
 checkpoints/
 logs/
-logs_experiments/
 .vscode/
 9_DilatedToothSegNet_*.pdf
 data/*

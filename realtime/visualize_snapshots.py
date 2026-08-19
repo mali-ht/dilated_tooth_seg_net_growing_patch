@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """visualize_snapshots.py -- offline analysis/rendering of a live run's snapshot sequence
-(testing/logs/snapshots/<run_id>/cycle_XXXX.npz, saved by LiveSegmenter._save_snapshot -
+(realtime/logs/snapshots/<run_id>/cycle_XXXX.npz, saved by LiveSegmenter._save_snapshot -
 mesh_viewer_segmented.py enables this by default, see its --snapshot_every/--no_snapshots).
 
 Built for a specific live-investigation question: a real run showed a small early patch (e.g. a
@@ -18,7 +18,7 @@ Deliberately does NOT import mesh_viewer_segmented.py (open3d/torch/model stack)
 utils/teeth_numbering.py's color tables, so this stays a fast, display-independent CLI tool.
 
 Usage:
-    python3 visualize_snapshots.py --snapshot_dir testing/logs/snapshots/<run_id>
+    python3 visualize_snapshots.py --snapshot_dir realtime/logs/snapshots/<run_id>
 """
 import argparse
 import glob
@@ -31,7 +31,9 @@ import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.collections import PolyCollection  # noqa: E402
 import numpy as np  # noqa: E402
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root -
+# this file moved from testing/realtime/ to realtime/ (one level shallower), so this now only
+# needs to strip 2 path components (file -> realtime -> root), not 3
 from utils.teeth_numbering import coarse_label_to_colors, label_to_colors  # noqa: E402
 
 GUM_COLOR_255 = np.array([255, 192, 203], dtype=np.uint8)  # matches mesh_viewer_segmented.py's palette

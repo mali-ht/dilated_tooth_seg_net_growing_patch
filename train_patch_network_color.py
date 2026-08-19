@@ -72,7 +72,7 @@ torch.set_num_interop_threads(1)  # confirmed empirically this is a SEPARATE poo
 #     PatchTeeth3DSDataset's early_bias_power) as CLI flags, defaulted to the SAME values those
 #     classes already default to (40/180/360mm2, 2.5) - so a run that doesn't pass them behaves
 #     identically to before. Added to investigate a real hardware finding: cycle_0001 of
-#     testing/logs/snapshots/mesh_viewer_segmented_20260815_122810/ shows the model predicting 5
+#     realtime/logs/snapshots/mesh_viewer_segmented_20260815_122810/ shows the model predicting 5
 #     different classes (0,7,8,9,10) on a 52.6mm2 patch that's realistically just 2 teeth - at
 #     that area only the first dilated block is gated on (area_thresholds[0]=40), and its own
 #     candidate pool (dilation_k=200) is already close to the whole patch's face count, so the
@@ -92,7 +92,7 @@ torch.set_num_interop_threads(1)  # confirmed empirically this is a SEPARATE poo
 #     existed anywhere in the training path - an occasional very large patch (late-stage/full-arch
 #     growth stages) made a single kernel run long enough to trip the watchdog. Live inference
 #     already solved this exact problem with max_model_faces=20000
-#     (testing/realtime/mesh_viewer_segmented.py) - reused here for the same reason and to keep
+#     (realtime/mesh_viewer_segmented.py) - reused here for the same reason and to keep
 #     train/inference face-count distributions consistent.
 
 SEED = 42
@@ -163,7 +163,7 @@ if __name__ == "__main__":
                          help='Disable automatic inverse-frequency FocalLoss weighting (on by default)')
     parser.add_argument('--class_alpha_samples', type=int, default=200,
                          help='How many patches to sample when measuring class frequency for FocalLoss alpha')
-    parser.add_argument('--tb_save_dir', type=str, default='tensorboard_logs')
+    parser.add_argument('--tb_save_dir', type=str, default='logs/tensorboard')
     parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
                          help='Where model checkpoints (.ckpt) are saved - kept separate from '
                               '--tb_save_dir so logs and (large) checkpoint files do not mix')

@@ -21,7 +21,7 @@ either viewer alone, carries none of that risk.
 
 The actual data pipeline (accumulate -> merge -> downsample -> infer -> color)
 is the LiveSegmenter class below, which has NO Open3D/GUI dependency and can
-be driven headlessly (see testing/realtime/test_live_segmenter.py) - the GUI
+be driven headlessly (see realtime/test_live_segmenter.py) - the GUI
 class just wraps it and pushes its output to the screen.
 """
 
@@ -43,17 +43,22 @@ import mesh_wire
 from debug_log import logger, setup_logging
 from mesh_viewer_linux import Conn, _have_gui
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # project root -
+# this file moved from testing/realtime/ to realtime/ (one level shallower), so this now only
+# needs to strip 2 path components (file -> realtime -> root), not 3
 from dataset.patch_preprocessing import PatchPreTransform  # noqa: E402
 from dataset.patch_preprocessing_real_color import PatchPreTransformWithRealColor  # noqa: E402
 from models.patch_collate import PatchCollator, precompute_neighbor_indices  # noqa: E402
 from models.patch_lightning_module import PatchLitDilatedToothSegmentationNetwork  # noqa: E402
 from dataset.patch_color_augmentation import GUM_RGB_HIGH, GUM_RGB_LOW, TOOTH_RGB_HIGH, TOOTH_RGB_LOW  # noqa: E402
-from testing.realtime.live_preprocessing import (NO_COLOR_SENTINEL, cap_face_count,  # noqa: E402
-                                                  claim_new_voxels, decimate_chunk_worker,
-                                                  downsample_to_density, merge_meshes,
-                                                  mesh_to_model_inputs, mesh_to_model_inputs_with_color,
-                                                  spatial_split, voxel_size_for_density)
+# live_preprocessing.py is a sibling in this same realtime/ directory - bare import, same
+# convention as mesh_wire/debug_log/mesh_viewer_linux above, resolves whether this file is run
+# directly (its own dir is auto-added to sys.path) or imported as realtime.mesh_viewer_segmented
+# (replay_guidance.py/test_live_segmenter.py both explicitly add realtime/ to sys.path themselves).
+from live_preprocessing import (NO_COLOR_SENTINEL, cap_face_count, claim_new_voxels,  # noqa: E402
+                                 decimate_chunk_worker, downsample_to_density, merge_meshes,
+                                 mesh_to_model_inputs, mesh_to_model_inputs_with_color,
+                                 spatial_split, voxel_size_for_density)
 from utils.teeth_numbering import (_coarse_class_color, _coarse_class_names, _teeth_codes_upper,  # noqa: E402
                                     _teeth_color, coarse_label_to_colors, label_to_colors,
                                     label_to_coarse_label, label_to_universal_number)
@@ -324,7 +329,7 @@ class LiveSegmenter:
         # Prediction-debugging methodology (per the live investigation request): every
         # snapshot_every'th cycle, process_once() dumps (mesh, per-face predicted labels,
         # area_mm2, dilation gate states) to snapshot_dir as a .npz - see
-        # testing/realtime/visualize_snapshots.py for the offline tool that turns a run's worth
+        # realtime/visualize_snapshots.py for the offline tool that turns a run's worth
         # of these into inspectable renders, so "how do predictions evolve as the accumulated
         # patch grows" can be looked at directly instead of only watched live in the GUI.
         self.snapshot_dir = snapshot_dir
@@ -673,7 +678,7 @@ class LiveSegmenter:
         face_colors: (F, 3) uint8 real per-face RGB actually fed to the model this cycle (see
         mesh_to_model_inputs_with_color) - None for a geometry-only checkpoint (self.use_color is
         False), saved as has_face_colors=False + an empty (0,3) array in that case so downstream
-        loaders (testing/realtime/visualize_snapshots.py) always get a consistently-shaped field
+        loaders (realtime/visualize_snapshots.py) always get a consistently-shaped field
         rather than needing to branch on a missing key. The point of saving this at all: added
         2026-08-19 after a real hardware run with the color-trained checkpoint scored noticeably
         worse than the geometry-only one - the leading hypothesis is a training/inference color
@@ -1227,8 +1232,8 @@ def main():
                           "raise it for a slower but more conservative one.")
     ap.add_argument("--snapshot_every", type=int, default=1,
                      help="save a (mesh, per-face predicted labels, area_mm2, dilation gate states) .npz "
-                          "every N cycles to testing/logs/snapshots/<run_id>/ - see "
-                          "testing/realtime/visualize_snapshots.py to turn a run's worth of these into "
+                          "every N cycles to realtime/logs/snapshots/<run_id>/ - see "
+                          "realtime/visualize_snapshots.py to turn a run's worth of these into "
                           "inspectable renders (default: every cycle)")
     ap.add_argument("--no_snapshots", action="store_true", help="disable snapshot saving entirely")
     ap.add_argument("--color_mode", choices=["varying", "flat"], default="varying",

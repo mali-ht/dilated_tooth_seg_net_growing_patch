@@ -45,12 +45,15 @@ from mesh_viewer_linux import Conn, _have_gui
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from dataset.patch_preprocessing import PatchPreTransform  # noqa: E402
+from dataset.patch_preprocessing_real_color import PatchPreTransformWithRealColor  # noqa: E402
 from models.patch_collate import PatchCollator, precompute_neighbor_indices  # noqa: E402
 from models.patch_lightning_module import PatchLitDilatedToothSegmentationNetwork  # noqa: E402
-from testing.realtime.live_preprocessing import (cap_face_count, claim_new_voxels,  # noqa: E402
-                                                  decimate_chunk_worker, downsample_to_density,
-                                                  merge_meshes, mesh_to_model_inputs, spatial_split,
-                                                  voxel_size_for_density)
+from dataset.patch_color_augmentation import GUM_RGB_HIGH, GUM_RGB_LOW, TOOTH_RGB_HIGH, TOOTH_RGB_LOW  # noqa: E402
+from testing.realtime.live_preprocessing import (NO_COLOR_SENTINEL, cap_face_count,  # noqa: E402
+                                                  claim_new_voxels, decimate_chunk_worker,
+                                                  downsample_to_density, merge_meshes,
+                                                  mesh_to_model_inputs, mesh_to_model_inputs_with_color,
+                                                  spatial_split, voxel_size_for_density)
 from utils.teeth_numbering import (_coarse_class_color, _coarse_class_names, _teeth_codes_upper,  # noqa: E402
                                     _teeth_color, coarse_label_to_colors, label_to_colors,
                                     label_to_coarse_label, label_to_universal_number)
@@ -76,6 +79,34 @@ _COMPASS = ["E", "NE", "N", "NW", "W", "SW", "S", "SE"]  # plain ASCII - Open3D'
                                                           # "?" - see _build_legend's "■" for the
                                                           # same issue); the real directional cue
                                                           # is the 3D arrow geometry, not this text
+
+
+def update_guidance_confirmation(counts, streaks: dict, confirmed: set, min_faces: int, confirm_cycles: int):
+    """Finding #13 (REALTIME.md) - mutates `streaks` and `confirmed` IN PLACE. A label needs
+    `confirm_cycles` CONSECUTIVE calls with counts[label] >= min_faces before being added to
+    `confirmed` - once added it stays there permanently (a later dip below min_faces does NOT
+    remove it; by the time a label has genuinely sustained min_faces for confirm_cycles cycles in a
+    row, a later single low-count cycle is far more likely to be its own transient noise than
+    evidence the earlier detection was wrong). A label that hasn't reached the streak requirement
+    yet has its streak reset to 0 the instant it dips below min_faces - this is what filters out a
+    momentary spike: real hardware data (2026-08-19) showed label 1 (left terminal molar) hit 31
+    faces for exactly one cycle then fell back under 30 for ~5 more before genuinely climbing much
+    later, and label 16 (right terminal molar) hit 34 faces for a few cycles then dropped to 0 for
+    ~40 cycles before a real, sustained, 500+ face detection began - neither would reach a 3-cycle
+    streak from those early spikes alone.
+
+    Kept as a standalone function (not inlined into _compute_guidance) specifically so
+    replay_guidance.py can drive it directly against saved snapshot data without needing a live
+    LiveSegmenter/model/GPU - that's how this fix was validated before ever touching live
+    behavior."""
+    for label in range(1, 17):
+        count = int(counts[label]) if label < len(counts) else 0
+        if count >= min_faces:
+            streaks[label] = streaks.get(label, 0) + 1
+            if streaks[label] >= confirm_cycles:
+                confirmed.add(label)
+        else:
+            streaks[label] = 0
 
 
 def _debug(msg):
@@ -173,12 +204,32 @@ class LiveSegmenter:
     """
 
     def __init__(self, model, device, num_classes=17, target_density=5.0, arch=None, max_model_faces=20000,
-                 pool_workers=6, snapshot_dir=None, snapshot_every=1):
+                 pool_workers=6, snapshot_dir=None, snapshot_every=1, color_mode='varying',
+                 guidance_confirm_cycles=8):
         self.model = model
         self.device = device
         self.num_classes = num_classes
         self.target_density = target_density
         self.arch = arch  # 'upper'/'lower' - only needed for 17-class Universal tooth numbers
+        # --color_mode 'flat': real captured color varies continuously across the mesh, but
+        # training only ever saw ONE flat value per class-group per patch (dataset/
+        # patch_color_augmentation.py's SyntheticColorPaint) - confirmed empirically (2026-08-19)
+        # that variance alone costs real accuracy. Interim mitigation (not a retrain) requested by
+        # the user: classify real captured color into tooth/gum (live_preprocessing.py's
+        # classify_and_flatten_colors) and repaint with ONE flat value each, drawn ONCE here and
+        # reused for the WHOLE scan (not redrawn per cycle) - matching training's one-draw-per-
+        # patch structure; redrawing every cycle would introduce a NEW instability (the fed color
+        # flickering between cycles for the same underlying geometry) that training never had
+        # either. 'varying' (default) preserves the original real-color-as-is behavior, unchanged.
+        self.color_mode = color_mode
+        self._flat_colors = None
+        if color_mode == 'flat':
+            rng = np.random.default_rng()
+            tooth_color = rng.uniform(TOOTH_RGB_LOW, TOOTH_RGB_HIGH).astype(np.uint8)
+            gum_color = rng.uniform(GUM_RGB_LOW, GUM_RGB_HIGH).astype(np.uint8)
+            self._flat_colors = (tooth_color, gum_color)
+            _debug(f"LiveSegmenter init: color_mode=flat - drew tooth_color={tooth_color.tolist()} "
+                   f"gum_color={gum_color.tolist()} for the whole scan")
         # Hard cap on the merged mesh actually fed to the model, independent of voxel dedup - see
         # process_once(). Confirmed via real-hardware testing (REALTIME.md): models/patch_layer.py's
         # EdgeGraphConvBlock 2/3 always fall back to an on-the-fly torch.cdist(x_t, x_t) over every
@@ -198,7 +249,12 @@ class LiveSegmenter:
         # than a full arch's true covered area needs - Finding #8, REALTIME.md), not on every
         # ordinary cycle.
         self.retention_ceiling = max(max_model_faces * 10, max_model_faces + 1)
-        self.transform = PatchPreTransform()
+        # Auto-detected from the loaded checkpoint's own saved hparams (feature_dim=27 for a
+        # color-trained model, dataset/patch_preprocessing_color.py's PatchPreTransformWithColor)
+        # rather than a separate CLI flag - avoids the checkpoint and the transform silently
+        # disagreeing with each other (feeding a 24-dim-trained model 27 dims, or vice versa).
+        self.use_color = getattr(model.hparams, 'feature_dim', 24) == 27
+        self.transform = PatchPreTransformWithRealColor() if self.use_color else PatchPreTransform()
         # k/dilation_ks read straight off the loaded checkpoint's own network (PatchCollator.
         # for_network), not passed separately - a live viewer using a different k than the
         # checkpoint was trained with would silently produce garbage neighbor graphs
@@ -207,7 +263,8 @@ class LiveSegmenter:
         _debug(f"LiveSegmenter init: num_classes={num_classes} target_density={target_density} "
                f"voxel_size={self.voxel_size:.3f}mm arch={arch} k={self.collator.k} "
                f"dilation_ks={self.collator.dilation_ks} device={device} max_model_faces={max_model_faces} "
-               f"retention_ceiling={self.retention_ceiling}")
+               f"retention_ceiling={self.retention_ceiling} use_color={self.use_color} "
+               f"color_mode={self.color_mode}")
         self.chunks = {}
         # mesh_id -> last known triangle count. Kept forever (tiny - one int per mesh_id) even
         # after a chunk's full vertex/triangle data is evicted from self.chunks, so raw_faces
@@ -240,6 +297,29 @@ class LiveSegmenter:
         # the right one - prevents a large, disorienting jump straight to whatever the right
         # sweep already silently progressed to while the scanner was still physically on the left.
         self.guidance_center_return_threshold_mm = 20.0
+
+        # Finding #13 (REALTIME.md): _compute_guidance used to rebuild its "confidently identified"
+        # set fresh from ONLY the current cycle's prediction counts - no memory across cycles. Real
+        # hardware showed this made guidance flicker on brief, noisy misclassification spikes: label
+        # 1 (left 3rd/terminal molar) hit 31 faces for ONE cycle while the scanner was still on the
+        # 1st molar, immediately marking the whole left sweep "done" and jumping the target to the
+        # right side - then flickering back once that label's count dropped below threshold again a
+        # few cycles later. guidance_confirm_cycles requires a label to stay >= guidance_min_faces
+        # for this many CONSECUTIVE cycles before counting as found - once genuinely confirmed it
+        # stays confirmed (a later dip doesn't un-confirm it - by that point it's overwhelmingly
+        # likely real, not noise). See update_guidance_confirmation() below for the actual logic and
+        # replay_guidance.py for how this was validated against saved real-hardware snapshots before
+        # ever touching live behavior. Default (8, not a smaller guess like 3) is itself
+        # empirically chosen - replaying real data showed 3 still let one out-of-order confirmation
+        # through (label 16 confirmed from a 3-cycle noise streak while labels 13/14/15, earlier in
+        # the sequence, weren't confirmed yet); 8 was the smallest tested value that produced a
+        # fully clean, in-order sweep on both sides against that same real run.
+        self.guidance_confirm_cycles = guidance_confirm_cycles
+        self._guidance_streaks = {}       # label -> consecutive cycles at/above threshold so far
+        self._guidance_confirmed = set()  # label -> permanently confirmed once the streak requirement is met
+        self._guidance_confirmed_pos = {}  # label -> last known centroid while confirmed (kept fresh
+                                            # when the label has enough faces THIS cycle, else reused)
+        _debug(f"LiveSegmenter init: guidance_confirm_cycles={self.guidance_confirm_cycles}")
 
         # Prediction-debugging methodology (per the live investigation request): every
         # snapshot_every'th cycle, process_once() dumps (mesh, per-face predicted labels,
@@ -280,10 +360,15 @@ class LiveSegmenter:
             f.result()
         _debug(f"LiveSegmenter init: worker pool ready in {time.time() - t0:.1f}s")
 
-    def update_chunk(self, mesh_id, vertices, triangles):
+    def update_chunk(self, mesh_id, vertices, triangles, colors=None):
+        """colors: optional (V, 3) uint8 real per-vertex RGB from the scanner (mesh_wire.
+        parse_mesh_payload's "colors"), matching vertices - only meaningful/kept when
+        self.use_color is set (a color-trained checkpoint is loaded); ignored otherwise so a
+        geometry-only run pays no extra cost for color data it'll never use."""
         n = len(triangles) if triangles is not None else 0
         with self._lock:
-            self.chunks[mesh_id] = {"vertices": vertices, "triangles": triangles}
+            self.chunks[mesh_id] = {"vertices": vertices, "triangles": triangles,
+                                     "colors": colors if self.use_color else None}
             prev = self._raw_faces_seen.get(mesh_id, 0)
             self._raw_faces_seen[mesh_id] = n
             self._raw_faces_total += (n - prev)
@@ -330,6 +415,7 @@ class LiveSegmenter:
         raw_centroids = {}  # mesh_id -> centroid of its own raw vertices, for motion-guidance (below)
         for mesh_id, chunk in chunks_snapshot.items():
             v, t = chunk["vertices"], chunk["triangles"]
+            c = chunk.get("colors") if self.use_color else None
             if v is None or t is None or len(v) == 0 or len(t) == 0:
                 continue
             signature = (len(v), len(t))
@@ -339,31 +425,37 @@ class LiveSegmenter:
             raw_centroids[mesh_id] = v.mean(axis=0)
             if len(t) > self.split_threshold_faces:
                 n_splits = min(self._pool_workers, math.ceil(len(t) / self.split_threshold_faces))
-                pieces = spatial_split(v, t, n_splits)
+                pieces = spatial_split(v, t, n_splits, colors=c)
             else:
-                pieces = [(v, t)]
+                pieces = [(v, t, c)]
             mesh_meta[mesh_id] = (signature, len(t), len(pieces))
             pieces_pending[mesh_id] = []
-            for pv, pf in pieces:
-                futures[self._pool.submit(decimate_chunk_worker, pv, pf, self.target_density)] = mesh_id
+            for pv, pf, pc in pieces:
+                futures[self._pool.submit(decimate_chunk_worker, pv, pf, self.target_density, pc)] = mesh_id
 
         t0 = time.time()
         for future in as_completed(futures):
             mesh_id = futures[future]
-            down_vertices, down_faces, t_worker = future.result()
+            down_vertices, down_faces, down_colors, t_worker = future.result()
             t_decimate += t_worker
-            pieces_pending[mesh_id].append((down_vertices, down_faces, t_worker))
+            pieces_pending[mesh_id].append((down_vertices, down_faces, down_colors, t_worker))
             if len(pieces_pending[mesh_id]) < mesh_meta[mesh_id][2]:
                 continue  # still waiting on this mesh_id's other spatial-split pieces
 
             signature, raw_face_count, n_pieces = mesh_meta[mesh_id]
-            piece_times = [pt for _, _, pt in pieces_pending[mesh_id]]
+            piece_times = [pt for _, _, _, pt in pieces_pending[mesh_id]]
+
+            def _piece_mesh(dv, df, dc):
+                m = trimesh.Trimesh(vertices=dv, faces=df, process=False)
+                if dc is not None:
+                    m.visual.vertex_colors = dc
+                return m
+
             if n_pieces == 1:
-                dv, df, _ = pieces_pending[mesh_id][0]
-                down_chunk = trimesh.Trimesh(vertices=dv, faces=df, process=False)
+                dv, df, dc, _ = pieces_pending[mesh_id][0]
+                down_chunk = _piece_mesh(dv, df, dc)
             else:
-                down_chunk = merge_meshes([trimesh.Trimesh(vertices=dv, faces=df, process=False)
-                                            for dv, df, _ in pieces_pending[mesh_id]])
+                down_chunk = merge_meshes([_piece_mesh(dv, df, dc) for dv, df, dc, _ in pieces_pending[mesh_id]])
             slowest_piece = max(piece_times)
             slow_tag = " [SLOW]" if slowest_piece > 0.3 else ""
             split_note = f" ({n_pieces} spatial pieces, slowest={slowest_piece:.3f}s)" if n_pieces > 1 else ""
@@ -373,7 +465,10 @@ class LiveSegmenter:
             t1 = time.time()
             keep_mask = claim_new_voxels(self._claimed_voxels, down_chunk, self.voxel_size)
             t_dedup += time.time() - t1
+            has_colors = down_chunk.visual.kind == 'vertex'
             kept = trimesh.Trimesh(vertices=down_chunk.vertices, faces=down_chunk.faces[keep_mask], process=False)
+            if has_colors:
+                kept.visual.vertex_colors = down_chunk.visual.vertex_colors
             if len(kept.faces) > 0:
                 new_meshes.append(kept)
 
@@ -420,10 +515,27 @@ class LiveSegmenter:
         if self._accumulated is None:
             self._accumulated = new_mesh
         else:
+            # any_colors (not all/and) - see live_preprocessing.merge_meshes's docstring for the
+            # 2026-08-19 bug this mirrors the fix for: an all-or-nothing check here meant a single
+            # color-less fold would silently wipe out every previously-accumulated real color,
+            # permanently, since self._accumulated is fully rebuilt below, not incrementally
+            # patched. A mesh lacking color contributes NO_COLOR_SENTINEL for its own vertices
+            # instead.
+            any_colors = self._accumulated.visual.kind == 'vertex' or new_mesh.visual.kind == 'vertex'
             offset = len(self._accumulated.vertices)
             vertices = np.concatenate([self._accumulated.vertices, new_mesh.vertices], axis=0)
             faces = np.concatenate([self._accumulated.faces, new_mesh.faces + offset], axis=0)
-            self._accumulated = trimesh.Trimesh(vertices=vertices, faces=faces, process=False)
+            colors = None
+            if any_colors:
+                acc_colors = (np.asarray(self._accumulated.visual.vertex_colors)[:, :3]
+                              if self._accumulated.visual.kind == 'vertex'
+                              else np.tile(NO_COLOR_SENTINEL, (len(self._accumulated.vertices), 1)))
+                new_colors = (np.asarray(new_mesh.visual.vertex_colors)[:, :3]
+                              if new_mesh.visual.kind == 'vertex'
+                              else np.tile(NO_COLOR_SENTINEL, (len(new_mesh.vertices), 1)))
+                colors = np.concatenate([acc_colors, new_colors], axis=0)
+            self._accumulated = trimesh.Trimesh(vertices=vertices, faces=faces, process=False,
+                                                 vertex_colors=colors)
         if len(self._accumulated.faces) > self.retention_ceiling:
             self._accumulated = cap_face_count(self._accumulated, self.retention_ceiling)
 
@@ -475,7 +587,15 @@ class LiveSegmenter:
                f"({decimated_faces - dedup_faces} redundant faces removed)")
 
         t1 = time.time()
-        pos, x, area_mm2 = mesh_to_model_inputs(down, self.transform)
+        real_face_colors = None  # (F, 3) uint8 - what actually got fed to the model this cycle,
+        # for snapshotting (see _save_snapshot) - None when not a color-trained checkpoint.
+        # Named distinctly from `colors` below (colors_for_predictions' render colors for the
+        # predicted-class overlay) - unrelated to this, don't conflate the two.
+        if self.use_color:
+            pos, x, area_mm2, real_face_colors = mesh_to_model_inputs_with_color(
+                down, self.transform, flat_colors=self._flat_colors)
+        else:
+            pos, x, area_mm2 = mesh_to_model_inputs(down, self.transform)
         t_feature = time.time() - t1
 
         t2 = time.time()
@@ -502,7 +622,7 @@ class LiveSegmenter:
         t_total = time.time() - t_cycle_start
 
         if self.snapshot_dir is not None and cycle % self.snapshot_every == 0:
-            self._save_snapshot(cycle, down, pred_labels, area_mm2, raw_faces, guidance)
+            self._save_snapshot(cycle, down, pred_labels, area_mm2, raw_faces, guidance, real_face_colors)
 
         counts = np.bincount(pred_labels, minlength=self.num_classes)
         hist = ", ".join(f"{c}:{n}" for c, n in enumerate(counts) if n > 0)
@@ -536,7 +656,7 @@ class LiveSegmenter:
         }
         return down, colors, label_positions, stats
 
-    def _save_snapshot(self, cycle, down, pred_labels, area_mm2, raw_faces, guidance):
+    def _save_snapshot(self, cycle, down, pred_labels, area_mm2, raw_faces, guidance, face_colors=None):
         """One .npz per snapshotted cycle - vertices/faces (float32/int32, keeps file size down),
         per-face predicted labels, and enough metadata (area_mm2, gate states, raw_faces,
         guidance) to correlate a prediction against how much real-world context the model had at
@@ -548,7 +668,22 @@ class LiveSegmenter:
 
         guidance_state is one of "none" (nothing to point at yet), "done" (regimen complete), or
         "active" (target_label/universal/distance_mm/compass/current_pos/target_pos all valid) -
-        the other guidance_* fields are NaN/-1/"" filled when not applicable for that state."""
+        the other guidance_* fields are NaN/-1/"" filled when not applicable for that state.
+
+        face_colors: (F, 3) uint8 real per-face RGB actually fed to the model this cycle (see
+        mesh_to_model_inputs_with_color) - None for a geometry-only checkpoint (self.use_color is
+        False), saved as has_face_colors=False + an empty (0,3) array in that case so downstream
+        loaders (testing/realtime/visualize_snapshots.py) always get a consistently-shaped field
+        rather than needing to branch on a missing key. The point of saving this at all: added
+        2026-08-19 after a real hardware run with the color-trained checkpoint scored noticeably
+        worse than the geometry-only one - the leading hypothesis is a training/inference color
+        distribution mismatch (training used flat, zero-variance synthetic color per class-group -
+        dataset/patch_color_augmentation.py's SyntheticColorPaint draws exactly ONE RGB value
+        shared by every tooth face and one shared by every gum face in a patch - real scanner
+        color naturally varies continuously across the mesh, a signal the model never saw). Saving
+        the actual fed-in color per cycle lets that be checked directly against the training
+        distribution (dataset/patch_color_augmentation.py's TOOTH_RGB_LOW/HIGH, GUM_RGB_LOW/HIGH)
+        instead of only being inferable indirectly from degraded predictions."""
         gates = getattr(self.model.model, "last_gates", (None, None, None))
         if guidance is None:
             guidance_state = "none"
@@ -576,6 +711,13 @@ class LiveSegmenter:
                 guidance_compass=np.str_(g.get("compass", "")),
                 guidance_current_pos=np.asarray(g.get("current_pos", [np.nan] * 3), dtype=np.float32),
                 guidance_target_pos=np.asarray(g.get("target_pos", [np.nan] * 3), dtype=np.float32),
+                # Finding #13 (REALTIME.md) - the sustained-confirmation set at THIS cycle, so a
+                # future investigation can directly see which labels were confirmed and when,
+                # rather than needing to reverse-engineer it from pred_labels + replay_guidance.py.
+                guidance_confirmed_labels=np.array(sorted(self._guidance_confirmed), dtype=np.int32),
+                has_face_colors=np.bool_(face_colors is not None),
+                face_colors=(face_colors.astype(np.uint8) if face_colors is not None
+                             else np.zeros((0, 3), dtype=np.uint8)),
             )
         except Exception as e:  # noqa: BLE001
             _debug(f"_save_snapshot: failed to write {path}: {e}")
@@ -621,10 +763,20 @@ class LiveSegmenter:
             return None
 
         counts = np.bincount(pred_labels, minlength=self.num_classes)
+        # Finding #13 (REALTIME.md): "confidently identified" now requires SUSTAINED evidence
+        # (guidance_confirm_cycles consecutive cycles), not a single cycle's threshold crossing -
+        # see update_guidance_confirmation's own docstring for why. centroids only ever contains
+        # confirmed labels; its position is refreshed whenever that label has enough faces THIS
+        # cycle, and otherwise reuses the last known position (a confirmed label can still have a
+        # noisy near-zero count on an individual cycle without losing its guidance target).
+        update_guidance_confirmation(counts, self._guidance_streaks, self._guidance_confirmed,
+                                      self.guidance_min_faces, self.guidance_confirm_cycles)
         centroids = {}
-        for label in range(1, 17):
+        for label in self._guidance_confirmed:
             if label < len(counts) and counts[label] >= self.guidance_min_faces:
-                centroids[label] = down.triangles_center[pred_labels == label].mean(axis=0)
+                self._guidance_confirmed_pos[label] = down.triangles_center[pred_labels == label].mean(axis=0)
+            if label in self._guidance_confirmed_pos:
+                centroids[label] = self._guidance_confirmed_pos[label]
 
         def first_missing(seq):
             for lbl in seq:
@@ -1064,12 +1216,30 @@ def main():
                           "on-the-fly O(N^2) torch.cdist with no cap of its own; confirmed live testing let the "
                           "merged mesh grow past 160k faces and try to allocate 100+ GiB (see REALTIME.md)")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--guidance_confirm_cycles", type=int, default=8,
+                     help="Finding #13 (REALTIME.md): a tooth needs this many CONSECUTIVE cycles "
+                          "at >= --guidance_min_faces before guidance treats it as confidently "
+                          "found - filters brief misclassification spikes (e.g. a terminal molar "
+                          "momentarily flagged while the scanner is still elsewhere) that used to "
+                          "make the arrow flicker or the regimen report done prematurely. Default "
+                          "(8) was empirically chosen via replay_guidance.py against real "
+                          "hardware snapshots - lower it for a more responsive but noisier arrow, "
+                          "raise it for a slower but more conservative one.")
     ap.add_argument("--snapshot_every", type=int, default=1,
                      help="save a (mesh, per-face predicted labels, area_mm2, dilation gate states) .npz "
                           "every N cycles to testing/logs/snapshots/<run_id>/ - see "
                           "testing/realtime/visualize_snapshots.py to turn a run's worth of these into "
                           "inspectable renders (default: every cycle)")
     ap.add_argument("--no_snapshots", action="store_true", help="disable snapshot saving entirely")
+    ap.add_argument("--color_mode", choices=["varying", "flat"], default="varying",
+                     help="Only meaningful for a color-trained checkpoint (feature_dim=27) - ignored "
+                          "otherwise. 'varying' (default): feed the model real captured scanner color "
+                          "as-is. 'flat': classify each face's real color as tooth-like or gum-like "
+                          "(live_preprocessing.py's classify_and_flatten_colors) and repaint with ONE "
+                          "flat value per class for the whole scan, matching training's own flat-per-"
+                          "class-group color structure - an interim mitigation for a confirmed "
+                          "training/inference color distribution mismatch (see Docs/REALTIME.md), not "
+                          "a fix in itself.")
     args = ap.parse_args()
 
     log_path = setup_logging()
@@ -1095,7 +1265,8 @@ def main():
     segmenter = LiveSegmenter(model, args.device, num_classes=args.num_classes,
                                target_density=args.target_density, arch=args.arch,
                                max_model_faces=args.max_faces, snapshot_dir=snapshot_dir,
-                               snapshot_every=args.snapshot_every)
+                               snapshot_every=args.snapshot_every, color_mode=args.color_mode,
+                               guidance_confirm_cycles=args.guidance_confirm_cycles)
 
     conn = Conn(args.host, args.port, args.retry)
     viewer = SegmentedViewerApp(lambda cmd: conn.send({"type": "cmd", "cmd": cmd}, b""), segmenter,
@@ -1148,7 +1319,15 @@ def main():
                            f"recv_blocked={recv_blocked_s:.3f}s gap_since_last_frame={gap_since_last_frame_s:.3f}s"
                            f"{gap_tag} (totals so far: {frame_count})")
                     viewer.push_raw(parsed)
-                    segmenter.update_chunk(parsed["mesh_id"], parsed["vertices"], parsed["triangles"])
+                    # mesh_wire.parse_mesh_payload's colors are float64 in [0,1] (raw 3xu8/255 -
+                    # see that file's own parsing); the color pipeline (live_preprocessing.py,
+                    # dataset/patch_preprocessing_color.py) works in uint8 [0,255] throughout,
+                    # matching training's synthetic-color convention, so convert once here at the
+                    # entry point rather than at every downstream stage.
+                    raw_colors = parsed.get("colors")
+                    colors_u8 = (raw_colors * 255.0).round().astype(np.uint8) if raw_colors is not None else None
+                    segmenter.update_chunk(parsed["mesh_id"], parsed["vertices"], parsed["triangles"],
+                                            colors_u8)
                     viewer.notify_new_data()
                 except Exception as e:  # noqa: BLE001
                     print(f"[!] parse mesh failed: {e}", file=sys.stderr)

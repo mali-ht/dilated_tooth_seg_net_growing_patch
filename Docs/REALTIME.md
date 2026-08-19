@@ -842,6 +842,91 @@ checks now running against the real 900 value, full pipeline timing) - zero regr
 dilated-block candidate-pool match check explicitly confirms 200/900/1800 all still verify exactly
 against brute-force.
 
+### Finding #13: premolar confusion + terminal-molar false positives make the model unfit as the robot's primary guide yet (guidance-logic flicker RESOLVED; underlying classification confusion NOT resolved)
+
+User's real-hardware assessment after the Finding #12/color-domain-gap fixes: following the arrow
+by hand would end the scan prematurely on both sides, never reaching teeth 1/2 or 15/16 (possibly
+3/14) - and separately, the model "confuses several premolars together." Investigated against the
+most recent color-mode-flat run (`mesh_viewer_segmented_20260819_141103`, 94 cycles, arch=upper),
+using `analyze_snapshot_colors.py`'s sibling analysis (per-cycle prediction histograms from the
+saved snapshots) plus the saved `guidance_state`/`guidance_target_label`/`guidance_distance_mm`
+fields directly. Two separate, independently-confirmed problems, not one:
+
+**1. Premolar confusion is real and reproducible on both sides of the arch** - not a one-off. In
+the raw per-cycle counts, labels 4/5 (left 1st/2nd premolar) and 12/13 (right 1st/2nd premolar)
+don't hand off cleanly as the scan progresses; they oscillate, swapping which one dominates
+cycle-to-cycle, on geometry that's barely changing (area moving only ~100-300mm² across many
+cycles in this window):
+
+| cycle | left-5 | left-4 | | cycle | right-12 | right-13 |
+|---|---|---|---|---|---|---|
+| 11 | 1407 | 441 | | 64 | 655 | 594 |
+| 16 | 2300 | 2493 | | 65 | 716 | 836 |
+| 18 | 2108 | 3317 | | 66 | 811 | 851 |
+| 22 | 3154 | 1949 | | 67 | 745 | 919 |
+
+A genuine progressive reveal (the scan physically moving from one premolar onto the next) would
+look monotonic - one label steadily growing while the other steadily shrinks. This doesn't; both
+stay large and repeatedly swap which is bigger, well past the point where full dilated context is
+available (area >4000mm², all three `area_thresholds` gates open per `patch_dilated_tooth_seg_network.py`'s
+own gating - so this specific confusion isn't explained by insufficient context the way the
+small-patch confusion investigated earlier in this session was). This is a genuine **model
+accuracy problem** - not fixed here, no code change addresses it. Candidate directions for a
+future retrain (not attempted): the whole-tooth/multi-tooth curriculum already on
+`Docs/MAA_ToDo.md`, the `dilation_k`/`area_thresholds` retrain experiment queued but not yet run,
+or simply more/better training data for adjacent-premolar discrimination specifically.
+
+**2. Terminal molars (labels 1 and 16, and to a lesser extent their neighbors) produce brief,
+noisy false-positive spikes, and `_compute_guidance` had zero temporal smoothing to reject them.**
+Label 16 (right 3rd/terminal molar) hit 34 faces at cycle 12 - while the scanner was still
+demonstrably working the *left* side (right premolars 12/13 showed exactly 0 faces until cycle
+60). It decayed back to 0 by cycle 22 and stayed there for ~40 cycles before a real, sustained
+detection began around cycle 68 (511, then 976 faces). Label 1 (left terminal molar) did the same
+thing on a faster timescale: a ramping-but-still-premature climb to 1131 faces by cycle 21, then a
+collapse back to near-zero for several cycles after.
+
+Read `_compute_guidance`'s actual code (not just its output) to find the real mechanism, since the
+observed behavior (a target reverting, then re-jumping) didn't match an initial hypothesis of
+"permanent lock-in": `centroids` was rebuilt from scratch EVERY cycle, using only that cycle's own
+`pred_labels` bincount (`counts[label] >= self.guidance_min_faces`) - no memory of any other
+cycle at all. So the bug isn't that a false positive gets stuck; it's that there's zero smoothing,
+so a single noisy cycle can flip the target, and it can flip right back on the next noisy cycle.
+Confirmed directly from this run's own saved guidance fields: target went `6→5→4→3→2` (cycles
+1-13, correctly progressing down the left sweep), then label 1's one-cycle 31-face blip at cycle
+18 immediately jumped the target to label 9 (right side) - before label 1 had any real chance of
+being on-mesh yet, since label 3 (1st molar, which comes BEFORE 1 in the sweep) had only just
+crossed threshold 5 cycles earlier. Target then reverted back to label 1 at cycle 26 once that
+count dropped again, then back to 9 at cycle 32. The whole regimen reported `"done": True` by
+cycle 77, substantially on the strength of label 16's stale cycle-12 noise never having been
+un-counted - then flickered back to `"active"` at cycle 92.
+
+**Fix (RESOLVED, verified against this same real run's saved data before ever touching live
+behavior):** `LiveSegmenter` now requires a label to stay `>= guidance_min_faces` for
+`guidance_confirm_cycles` CONSECUTIVE cycles before counting it as confirmed
+(`update_guidance_confirmation`, `testing/realtime/mesh_viewer_segmented.py`) - and once a label
+is genuinely confirmed, a later dip does not un-confirm it (by that point a single noisy cycle is
+far more likely than the earlier sustained detection being wrong). New
+`--guidance_confirm_cycles` CLI flag, `guidance_confirmed_labels` added to every snapshot for
+future debugging.
+
+New `replay_guidance.py` replays a saved run's real per-cycle predictions through the actual
+`update_guidance_confirmation` function (imported, not reimplemented, so this tests the real code
+path) and reports the regimen's stage/target transitions under the old vs new logic, without
+needing live hardware. Against this run: **stage/target transitions dropped from 17 to 9** with
+the initial guess of `guidance_confirm_cycles=3`, but that value still let one out-of-order
+confirmation through (label 16 cleared a 3-cycle noise streak while labels 13/14/15, earlier in
+the sequence, weren't confirmed yet). Swept `confirm_cycles` empirically: **8 was the smallest
+value that produced a fully clean, strictly in-order sweep on both sides** (`LEFT: 8→6→5→4→3→2`,
+`RIGHT: 12→13→14→15→16→DONE`, no skips, no reversals) - set as the new default.
+
+**What this fix does and doesn't do:** it directly targets the specific failure mode described -
+the arrow flickering and the regimen reporting done before the physical scan reached the terminal
+teeth - and the replay evidence shows it works. It does NOT fix problem #1 (premolar confusion)
+or the underlying reason the model produces molar false-positives at all - it only stops a
+transient model error from permanently derailing the guidance state machine. The model itself
+still isn't reliable enough to be the robot's unsupervised primary guide; this is a mitigation on
+top of a real, unresolved accuracy gap, not a substitute for closing it.
+
 ## How to run it
 
 Against real hardware, single viewer (the common case):
@@ -852,6 +937,13 @@ python3 testing/realtime/mesh_viewer_segmented.py \
   --arch <upper|lower>
 ```
 `--max_faces` defaults to 20000 (see Finding #5) - only pass it explicitly to change that cap.
+`--guidance_confirm_cycles` defaults to 8 (see Finding #13) - lower for a more responsive but
+noisier arrow, raise for a slower but more conservative one. `--color_mode {varying,flat}` and
+`--color_style {flat,mosaic}` (that second one is a *training*-time flag, not this script's) are
+covered in the color findings above. `analyze_snapshot_colors.py` and `replay_guidance.py` are
+offline tools that replay a saved run's snapshots - no live hardware needed - to check captured
+color against the training distribution and guidance stage/target transitions under the current
+vs. a candidate `--confirm_cycles` value, respectively.
 
 Against real hardware, both viewers at once:
 ```bash

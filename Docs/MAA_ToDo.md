@@ -172,7 +172,7 @@ scan-sweep curriculum with a hand-designed alternative.
    whole-tooth patches mixed in, using the snapshot methodology already built
    (`testing/realtime/visualize_snapshots.py`) as the measurement tool.
 
-## Real-hardware finding: terminal molars (labels 1 and 16) systematically over-predicted (NEW - motivates the above)
+## Real-hardware finding: terminal molars (labels 1 and 16) systematically over-predicted (guidance-flicker impact RESOLVED via REALTIME.md Finding #13; underlying model accuracy still OPEN)
 
 Confirmed across TWO independent real-hardware runs (`mesh_viewer_segmented_20260815_111441`,
 `_104816`) via the snapshot logging - label 16 (rightmost 3rd molar) grows to 2,700-3,000 faces by
@@ -188,6 +188,27 @@ Practical impact: this is directly why the live scan guide (REALTIME.md's motion
 was seen ending prematurely - a small/spurious early bleed of label 1 or 16 face count crosses
 `guidance_min_faces` before that tooth is genuinely fully covered, since the guidance system only
 checks "is a label present with enough faces," not "does this look like genuine full coverage."
+
+**Update 2026-08-19 (REALTIME.md Finding #13):** reconfirmed on a THIRD independent run, with the
+exact mechanism nailed down this time (previous entry above only had the general hypothesis) - the
+false-positive spikes are brief and often self-correct within 5-10 cycles, but
+`_compute_guidance` had zero memory across cycles, so even a one-cycle blip could immediately flip
+the guidance target and the completion state. Fixed: guidance now requires a label to stay above
+threshold for `guidance_confirm_cycles` (8, empirically chosen) CONSECUTIVE cycles before counting
+it as found. This fixes the GUIDANCE-STATE-MACHINE symptom (verified via `replay_guidance.py`
+against real saved data - regimen stage/target transitions dropped from 17 to 9, and the sweep
+became strictly in-order on both sides). It does NOT fix the underlying reason the model produces
+these false positives in the first place - that's still this section's two hypotheses below,
+unconfirmed and unaddressed.
+
+**Also confirmed this same session, a related but SEPARATE finding:** premolars (labels 4/5 on the
+left, 12/13 on the right) show genuine, reproducible confusion on both sides of the arch - not a
+guidance-logic issue at all, a real classification accuracy problem. The two labels oscillate,
+swapping which dominates cycle-to-cycle, on geometry that's barely changing - not the monotonic
+handoff a real progressive scan reveal would produce. Happens well past the point where full
+dilated context is available (area >4000mm², all `area_thresholds` gates open), so it isn't
+explained by the small-patch-context issue documented elsewhere in this file. No mitigation
+attempted yet - see REALTIME.md Finding #13 for the full cycle-by-cycle evidence.
 
 Two distinct, unconfirmed root-cause hypotheses worth investigating before assuming which one it
 is:

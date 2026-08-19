@@ -38,7 +38,7 @@ from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 
-from dataset.patch_dataset import PatchTeeth3DSDataset
+from dataset.patch_dataset_whole_tooth import DEFAULT_MARGIN_MM, PatchTeeth3DSDatasetWithWholeTooth
 from dataset.patch_face_cap import DEFAULT_MAX_FACES, MaxFaceCapTransform
 from dataset.patch_losses import compute_class_alpha
 from dataset.patch_preprocessing_color import PatchPreTransformWithColor
@@ -111,7 +111,7 @@ seed_everything(SEED, workers=True)
 
 
 def get_datasets(root, processed_folder, train_test_split, num_classes, early_bias_power, max_faces,
-                  color_style='flat'):
+                  color_style='flat', whole_tooth_patch_prob=0.3, whole_tooth_margin_mm=DEFAULT_MARGIN_MM):
     color_transform_cls = {
         'flat': PatchPreTransformWithColor,
         'mosaic': PatchPreTransformWithRealisticColor,
@@ -120,14 +120,29 @@ def get_datasets(root, processed_folder, train_test_split, num_classes, early_bi
     def make_transform():
         return MaxFaceCapTransform(color_transform_cls(classes=num_classes), max_faces=max_faces)
 
-    train = PatchTeeth3DSDataset(root, processed_folder=processed_folder, num_classes=num_classes,
-                                  is_train=True, train_test_split=train_test_split,
-                                  early_bias_power=early_bias_power,
-                                  transform=make_transform())
-    val = PatchTeeth3DSDataset(root, processed_folder=processed_folder, num_classes=num_classes,
-                                is_train=False, train_test_split=train_test_split,
-                                early_bias_power=early_bias_power,
-                                transform=make_transform())
+    # PatchTeeth3DSDatasetWithWholeTooth (dataset/patch_dataset_whole_tooth.py, additive subclass -
+    # PatchTeeth3DSDataset itself untouched): at whole_tooth_patch_prob=0.0 every draw still takes
+    # the original scan-sweep growth path, just via a subclass __getitem__ that duplicates it rather
+    # than the base class's own - see that file's own docstring on why this isn't byte-identical to
+    # plain PatchTeeth3DSDataset output even at 0.0 (same distribution, different specific rng draws).
+    train = PatchTeeth3DSDatasetWithWholeTooth(
+        root, processed_folder=processed_folder, num_classes=num_classes,
+        is_train=True, train_test_split=train_test_split, early_bias_power=early_bias_power,
+        transform=make_transform(), whole_tooth_patch_prob=whole_tooth_patch_prob,
+        whole_tooth_margin_mm=whole_tooth_margin_mm)
+    # val stays pinned to whole_tooth_patch_prob=0.0 (pure scan-sweep) REGARDLESS of the train-side
+    # knob above - the live client (realtime/mesh_viewer_segmented.py) only ever generates
+    # scan-sweep-footprint patches, never whole-tooth ones, so val_miou needs to keep measuring
+    # performance on that same real-deployment distribution for it to stay comparable across runs
+    # (e.g. against the color_baseline/color_tuned checkpoints already in checkpoints/, both pure
+    # scan-sweep). Mixing whole-tooth patches into val would answer a different question ("does the
+    # model also get better at whole-tooth patches") instead of the one that matters here (does
+    # training WITH them improve real scan-sweep performance).
+    val = PatchTeeth3DSDatasetWithWholeTooth(
+        root, processed_folder=processed_folder, num_classes=num_classes,
+        is_train=False, train_test_split=train_test_split, early_bias_power=early_bias_power,
+        transform=make_transform(), whole_tooth_patch_prob=0.0,
+        whole_tooth_margin_mm=whole_tooth_margin_mm)
     return train, val
 
 
@@ -181,6 +196,29 @@ if __name__ == "__main__":
                          help='mm^2 area a patch must reach for dilated blocks 1/2/3 to gate on - '
                               'default matches PatchDilatedToothSegmentationNetwork\'s own default, '
                               'so omitting this flag reproduces current behavior exactly')
+    parser.add_argument('--dilation_ks', type=int, nargs=3, default=[200, 900, 1800],
+                         metavar=('K1', 'K2', 'K3'),
+                         help='Candidate-neighborhood size (pre-FPS-downsample) for dilated blocks '
+                              '1/2/3 - default matches PatchDilatedToothSegmentationNetwork\'s own '
+                              'default. Larger values let a block see further across the patch '
+                              'before subsampling, at the cost of a bigger cdist in '
+                              'models/patch_collate.py\'s neighbor precompute - see --max_faces\'s '
+                              'own help on the GPU driver watchdog risk that already bit the '
+                              '2026-08-19 tuned-area_thresholds run (crashed at epoch 56/99 with a '
+                              'CUDA launch timeout, logs/experiments/17class_gateOn_color_tuned.log)')
+    parser.add_argument('--whole_tooth_patch_prob', type=float, default=0.3,
+                         help='Fraction of TRAIN draws that use the whole-tooth curriculum '
+                              '(dataset/patch_generator_whole_tooth.py: ground-truth-label-bounded, '
+                              'margin-dilated, grown one whole tooth at a time) instead of the '
+                              'existing scan-sweep local-footprint growth - mixed in probabilistically '
+                              'per Docs/MAA_ToDo.md step 4, NOT a replacement. val always uses 0.0 '
+                              '(pure scan-sweep) regardless of this flag - see get_datasets()\'s own '
+                              'comment on why.')
+    parser.add_argument('--whole_tooth_margin_mm', type=float, default=DEFAULT_MARGIN_MM,
+                         help='Spatial dilation margin (mm) applied to each whole-tooth mask before '
+                              'use - user-decided 2026-08-19 default of 1.5mm, see '
+                              'dataset/patch_generator_whole_tooth.py\'s own comment on why a pure '
+                              'label-boundary mask (margin=0) is unlike anything a real scan produces')
     parser.add_argument('--early_bias_power', type=float, default=2.5,
                          help='How hard training patch-stage sampling skews toward small/early '
                               'stages (rng.random()**power) - default matches '
@@ -207,7 +245,8 @@ if __name__ == "__main__":
 
     train_dataset, val_dataset = get_datasets(args.root, args.processed_folder, args.train_test_split,
                                                args.num_classes, args.early_bias_power, args.max_faces,
-                                               args.color_style)
+                                               args.color_style, args.whole_tooth_patch_prob,
+                                               args.whole_tooth_margin_mm)
 
     class_alpha = None
     if not args.no_class_weights:
@@ -218,7 +257,8 @@ if __name__ == "__main__":
 
     model = PatchLitDilatedToothSegmentationNetwork(
         num_classes=args.num_classes, feature_dim=27, dilation_gating=(args.dilation_gating == 'on'),
-        area_thresholds=tuple(args.area_thresholds), class_alpha=class_alpha, lr=args.lr)
+        area_thresholds=tuple(args.area_thresholds), dilation_ks=tuple(args.dilation_ks),
+        class_alpha=class_alpha, lr=args.lr)
 
     train_dataloader, val_dataloader = get_dataloaders(train_dataset, val_dataset, model, args.num_workers)
 

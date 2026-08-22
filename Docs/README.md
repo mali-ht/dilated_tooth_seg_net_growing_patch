@@ -1,13 +1,13 @@
 # DilatedToothSegNet: Tooth Segmentation Network on 3D Dental Meshes Through Increasing Receptive Vision
 
-<img src="images/image18.gif" width="300"/> <img src="images/image20.gif" width="300"/> 
+<img src="../Misc/images/image18.gif" width="300"/> <img src="../Misc/images/image20.gif" width="300"/> 
 
 This repository contains the code for the journal paper: <br>
 **DilatedToothSegNet: Tooth Segmentation Network on 3D Dental Meshes Through Increasing Receptive Vision <br>
 Authors: Lucas Krenmayr, Reinhold von Schwerin, Daniel Schaudt, Pascal Riedel, Alexander Hafner** <br>
 This paper is published in the Journal of Imaging Informatics in Medicine (JIIM) and can be accessed [here](https://link.springer.com/article/10.1007/s10278-024-01061-6).
 
-<img src="images/graphical_abstract.jpg" width="700"/> 
+<img src="../Misc/images/graphical_abstract.jpg" width="700"/> 
 
 ## Abstract
 *The utilization of advanced intraoral scanners to acquire 3D dental models has gained significant popularity in the fields of dentistry and orthodontics. Accurate segmentation and labeling of teeth on digitized 3D dental surface models are crucial for computer-aided treatment planning. At the same time, manual labeling of these models is a time-consuming task. Recent advances in geometric deep learning have demonstrated remarkable efficiency in surface segmentation when applied to raw 3D models. However, segmentation of the dental surface remains challenging due to the atypical and diverse appearance of the patients’ teeth. Numerous deep learning methods have been proposed to automate dental surface segmentation. Nevertheless, they still show limitations, particularly in cases where teeth are missing or severely misaligned. To overcome these challenges, we introduce a network operator called dilated edge convolution, which enhances the network’s ability to learn additional, more distant features by expanding its receptive field. This leads to improved segmentation results, particularly in complex and challenging cases. To validate the effectiveness of our proposed method, we performed extensive evaluations on the recently published benchmark data set for dental model segmentation Teeth3DS. We compared our approach with several other state-of-the-art methods using a quantitative and qualitative analysis. Through these evaluations, we demonstrate the superiority of our proposed method, showcasing its ability to outperform existing approaches in dental surface segmentation.*

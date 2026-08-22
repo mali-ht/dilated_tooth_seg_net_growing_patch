@@ -23,3 +23,28 @@ lightning==2.1.0
 imgaug==0.4.0
 trimesh==4.0.10
 pyfqmr==0.2.0
+
+# --- added 2026-08-20, see Docs/SETUP.md ---
+
+# REQUIRED, not optional: models/patch_collate.py imports numba at module level, so every
+# train_patch_network*.py run dies at import with ModuleNotFoundError without it. It was missing
+# from this file until 2026-08-20 even though the code has always depended on it.
+# Pinned to 0.58.x on purpose: numba constrains numpy, and the unpinned/newer releases resolve
+# numpy above the 1.24.4 pinned above, which in turn breaks the torch 2.1.0+cu121 ABI.
+# 0.58.1 declares numpy>=1.22,<1.27, so it accepts 1.24.4 and leaves it untouched.
+numba==0.58.1
+
+# lightning 2.1.0 calls pkg_resources.declare_namespace() at import time. pkg_resources was
+# deprecated in setuptools 81 and REMOVED in 82, so a modern setuptools (conda/venv ship 80+ now)
+# makes `import lightning` fail with ModuleNotFoundError: No module named 'pkg_resources'.
+# The deprecation warning this prints on every run is expected and harmless.
+setuptools<81
+
+# Used by torch.utils.cpp_extension to build pointnet2_ops_lib's CUDA extension in parallel.
+# Not strictly required (there is a much slower serial fallback), but the upstream README and
+# Dockerfile both install it before building, so keep it here to make that a one-step install.
+# NOTE: `pip check` reports "ninja 1.11.1.1 is not supported on this platform" for this wheel.
+# That is a cosmetic defect in ninja's own wheel metadata, NOT a broken install - the shipped
+# binary runs fine (`ninja --version` -> 1.11.1.git.kitware.jobserver-1 on x86_64 Linux).
+# Verified 2026-08-20; do not gate an automated install on a clean `pip check` because of it.
+ninja==1.11.1.1

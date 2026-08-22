@@ -61,16 +61,23 @@ python setup.py install
 ```
 
 ### Local Installation
+
+> **For a fresh GPU machine, use [SETUP.md](SETUP.md) instead** — it covers the NVIDIA driver,
+> the Python 3.10 / CUDA 12.1 / gcc-12 toolchain these pins actually require, and the
+> `setup_server.sh` script that installs the whole stack unattended and verifies it.
+> The steps below assume that toolchain already exists.
+
 To install the required dependencies, run the following command:
 ```bash
 pip install -r requirements.txt
 ```
 Install PointNet++ Ops Library:
 ```bash
-pip install ninja
-cd pointnet2_ops_lib
-python setup.py install
+pip install --no-build-isolation ./pointnet2_ops_lib
 ```
+`--no-build-isolation` is required: `pointnet2_ops_lib/setup.py` imports `torch` at module level,
+which a PEP 517 isolated build cannot see. (The older `python setup.py install` also still works,
+but is deprecated and removed in setuptools 80+.)
 
 ### Data
 The data used in this project is the Teeth3DS dataset, which can be downloaded from [here](https://github.com/abenhamadou/3DTeethSeg22_challenge) <br>

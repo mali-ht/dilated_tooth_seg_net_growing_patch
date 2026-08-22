@@ -41,11 +41,14 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from dataset.patch_dataset_whole_tooth import DEFAULT_MARGIN_MM, PatchTeeth3DSDatasetWithWholeTooth
 from dataset.patch_face_cap import DEFAULT_MAX_FACES, MaxFaceCapTransform
 from dataset.patch_losses import compute_class_alpha
+from dataset.patch_preprocessing import PatchPreTransform
 from dataset.patch_preprocessing_color import PatchPreTransformWithColor
 from dataset.patch_preprocessing_color_dropout import ColorDropoutWrapper
-from dataset.patch_preprocessing_realistic_color import PatchPreTransformWithRealisticColor
+from dataset.patch_preprocessing_realistic_color_hsv import PatchPreTransformWithRealisticColorHSV
 from models.patch_collate import PatchCollator
 from models.patch_lightning_module import PatchLitDilatedToothSegmentationNetwork
+from models.patch_lightning_module_transformer import PatchLitDilatedToothSegTransformerNetwork
+from models.patch_lightning_module_transformer_deep import PatchLitDilatedToothSegTransformerDeepNetwork
 
 torch.set_num_threads(1)  # same reasoning as the env vars above - belt-and-suspenders for any
 # torch CPU op that doesn't consult the env vars (interpreter-level torch threading, distinct
@@ -115,9 +118,25 @@ def get_datasets(root, processed_folder, train_test_split, num_classes, early_bi
                   color_style='flat', whole_tooth_patch_prob=0.3, whole_tooth_margin_mm=DEFAULT_MARGIN_MM,
                   color_dropout_prob=0.0):
     color_transform_cls = {
+        # Added 2026-08-22 for the RGB-effectiveness ablation (run_experiment_matrix.sh): the
+        # plain 24-dim PatchPreTransform (dataset/patch_preprocessing.py, untouched) - no color
+        # channel appended at all, not even a zeroed one. Same __init__(scale_mm, classes)
+        # signature as every *WithColor* transform below, so it drops into color_transform_cls(
+        # classes=num_classes) identically - no special-casing needed at the call site.
+        'none': PatchPreTransform,
         'flat': PatchPreTransformWithColor,
-        'mosaic': PatchPreTransformWithRealisticColor,
+        # Switched 2026-08-22 to the HSV-space paint (dataset/patch_color_augmentation.py's
+        # RealisticColorPaintHSV) - the original RealisticColorPaint's independent-per-channel RGB
+        # noise was confirmed (testing/visualize_training_input.py) to occasionally produce
+        # implausible saturated colors (a sampled tooth face came out as visible purple/magenta).
+        # RealisticColorPaint/PatchPreTransformWithRealisticColor are left untouched as a fallback,
+        # same precedent as SyntheticColorPaint being kept when RealisticColorPaint was added.
+        'mosaic': PatchPreTransformWithRealisticColorHSV,
     }[color_style]
+
+    if color_style == 'none' and color_dropout_prob > 0.0:
+        raise ValueError("--color_dropout_prob > 0 has no meaning with --color_style none - there's "
+                          "no color channel to drop out of a 24-dim (geometry-only) feature vector.")
 
     def make_transform():
         inner = color_transform_cls(classes=num_classes)
@@ -213,6 +232,47 @@ if __name__ == "__main__":
                               'own help on the GPU driver watchdog risk that already bit the '
                               '2026-08-19 tuned-area_thresholds run (crashed at epoch 56/99 with a '
                               'CUDA launch timeout, logs/experiments/17class_gateOn_color_tuned.log)')
+    parser.add_argument('--architecture', choices=['dilated', 'dilated_transformer'], default='dilated',
+                         help="'dilated' (default, unchanged): PatchDilatedToothSegmentationNetwork - "
+                              "local + dilated edge-conv blocks only. 'dilated_transformer': "
+                              "PatchDilatedToothSegTransformerNetwork (models/patch_dilated_tooth_seg_"
+                              "transformer_network.py) - same backbone plus a GlobalTokenTransformerBlock "
+                              "(models/patch_transformer_layer.py) run in parallel with the dilated "
+                              "blocks, giving every point genuine all-pairs global context that no "
+                              "existing block provides (FPS-downsample to a token budget, self-attend "
+                              "among tokens, cross-attend tokens back onto every point - see that "
+                              "file's own module docstring for the full reasoning and the O(N^2) "
+                              "cost argument against attending over every face directly). Added "
+                              "2026-08-22, motivated by the tooth-4-vs-5 premolar confusion this "
+                              "project's own dilation_ks widening experiment only partly addressed "
+                              "through wider LOCAL context alone (Docs/REALTIME.md).")
+    parser.add_argument('--transformer_tokens', type=int, default=256,
+                         help="Only used with --architecture dilated_transformer. FPS token budget "
+                              "for the global attention block - clamped to the patch's own face count "
+                              "for small patches.")
+    parser.add_argument('--transformer_layers', type=int, default=2,
+                         help="Only used with --architecture dilated_transformer. Self-attention "
+                              "layers among the FPS-sampled tokens.")
+    parser.add_argument('--transformer_heads', type=int, default=4,
+                         help="Only used with --architecture dilated_transformer. Attention heads, "
+                              "both for token self-attention and the point<-tokens cross-attention "
+                              "broadcast.")
+    parser.add_argument('--add_late_global', action='store_true',
+                         help="Only used with --architecture dilated_transformer. Adds a SECOND "
+                              "GlobalTokenTransformerBlock (models/patch_dilated_tooth_seg_"
+                              "transformer_deep_network.py) operating on global_hidden_layer's "
+                              "fused 1024-dim local+dilated+early-global output, instead of just "
+                              "the first block's raw 60-dim local-only input - richer per-token "
+                              "context for a second, later global attention pass, on top of (not "
+                              "instead of) the early one. Joins after PointFeatureImportance, "
+                              "widening res_block1's input - does NOT replace res_block1/res_block2/ "
+                              "the output head (see that file's own module docstring for why).")
+    parser.add_argument('--late_transformer_embed_dim', type=int, default=128,
+                         help="Only used with --add_late_global. Embed dim for the late block - "
+                              "compressed down from its 1024-dim input by default (unlike the "
+                              "early block, which matches its 60-dim input exactly), since "
+                              "attention cost scales with embed_dim too and a full 1024-dim pass "
+                              "would partially undo FPS-downsampling's point.")
     parser.add_argument('--whole_tooth_patch_prob', type=float, default=0.3,
                          help='Fraction of TRAIN draws that use the whole-tooth curriculum '
                               '(dataset/patch_generator_whole_tooth.py: ground-truth-label-bounded, '
@@ -236,15 +296,20 @@ if __name__ == "__main__":
                               'prevents the uncapped O(N^2) local edge-conv cdist from triggering '
                               'a GPU driver watchdog kill on very large patches. Matches live '
                               "inference's own max_model_faces default (20000).")
-    parser.add_argument('--color_style', choices=['flat', 'mosaic'], default='flat',
+    parser.add_argument('--color_style', choices=['none', 'flat', 'mosaic'], default='flat',
                          help="'flat' (default, unchanged): SyntheticColorPaint - one shared RGB "
                               "draw per class-group per patch, from hand-picked TOOTH_RGB_LOW/HIGH "
-                              "and GUM_RGB_LOW/HIGH ranges. 'mosaic': RealisticColorPaint - every "
-                              "face gets its own independent draw from the MEASURED real scanner "
-                              "color distribution (analyze_snapshot_colors.py) - both in "
-                              "dataset/patch_color_augmentation.py. Added 2026-08-19 after "
-                              "confirming empirically that flat's zero intra-class variance, not "
-                              "just its color values, was itself hurting live hardware accuracy.")
+                              "and GUM_RGB_LOW/HIGH ranges. 'mosaic': RealisticColorPaintHSV - every "
+                              "face gets its own draw (correlated HSV, not independent RGB - see "
+                              "dataset/patch_color_augmentation.py) in a cream/white/yellowish "
+                              "(teeth) or red/pink (gum) hue family, calibrated to the MEASURED real "
+                              "scanner color distribution (analyze_snapshot_colors.py). Added "
+                              "2026-08-19 after confirming empirically that flat's zero intra-class "
+                              "variance, not just its color values, was itself hurting live hardware "
+                              "accuracy. 'none': plain PatchPreTransform, no color channel at all "
+                              "(feature_dim=24, not 27) - the RGB-effectiveness ablation baseline "
+                              "(added 2026-08-22, run_experiment_matrix.sh) - --color_dropout_prob "
+                              "must be 0 with this choice, there's no color to drop out of.")
     parser.add_argument('--color_dropout_prob', type=float, default=0.0,
                          help='Fraction of faces per patch whose color is overwritten with the '
                               'live no-color sentinel (dataset/patch_preprocessing_color_dropout.py) '
@@ -279,15 +344,39 @@ if __name__ == "__main__":
                                            n_samples=args.class_alpha_samples)
         print(f'class_alpha: {class_alpha.tolist()}')
 
-    model = PatchLitDilatedToothSegmentationNetwork(
-        num_classes=args.num_classes, feature_dim=27, dilation_gating=(args.dilation_gating == 'on'),
-        area_thresholds=tuple(args.area_thresholds), dilation_ks=tuple(args.dilation_ks),
-        class_alpha=class_alpha, lr=args.lr)
+    if args.add_late_global and args.architecture != 'dilated_transformer':
+        print("[!] --add_late_global has no effect without --architecture dilated_transformer - ignoring it.")
+
+    # 24 base geometry dims + 3 color dims, unless --color_style none (24 only) - see
+    # get_datasets()'s color_transform_cls dict above.
+    feature_dim = 24 if args.color_style == 'none' else 27
+
+    if args.architecture == 'dilated_transformer' and args.add_late_global:
+        model = PatchLitDilatedToothSegTransformerDeepNetwork(
+            num_classes=args.num_classes, feature_dim=feature_dim, dilation_gating=(args.dilation_gating == 'on'),
+            area_thresholds=tuple(args.area_thresholds), dilation_ks=tuple(args.dilation_ks),
+            transformer_tokens=args.transformer_tokens, transformer_layers=args.transformer_layers,
+            transformer_heads=args.transformer_heads, late_transformer_embed_dim=args.late_transformer_embed_dim,
+            class_alpha=class_alpha, lr=args.lr)
+    elif args.architecture == 'dilated_transformer':
+        model = PatchLitDilatedToothSegTransformerNetwork(
+            num_classes=args.num_classes, feature_dim=feature_dim, dilation_gating=(args.dilation_gating == 'on'),
+            area_thresholds=tuple(args.area_thresholds), dilation_ks=tuple(args.dilation_ks),
+            transformer_tokens=args.transformer_tokens, transformer_layers=args.transformer_layers,
+            transformer_heads=args.transformer_heads, class_alpha=class_alpha, lr=args.lr)
+    else:
+        model = PatchLitDilatedToothSegmentationNetwork(
+            num_classes=args.num_classes, feature_dim=feature_dim, dilation_gating=(args.dilation_gating == 'on'),
+            area_thresholds=tuple(args.area_thresholds), dilation_ks=tuple(args.dilation_ks),
+            class_alpha=class_alpha, lr=args.lr)
 
     train_dataloader, val_dataloader = get_dataloaders(train_dataset, val_dataset, model, args.num_workers)
 
     if args.experiment_version is None:
-        experiment_version = f'nc{args.num_classes}_dg{args.dilation_gating}_color_{args.color_style}'
+        arch_tag = '' if args.architecture == 'dilated' else f'_{args.architecture}'
+        if args.architecture == 'dilated_transformer' and args.add_late_global:
+            arch_tag += '_lateglobal'
+        experiment_version = f'nc{args.num_classes}_dg{args.dilation_gating}_color_{args.color_style}{arch_tag}'
     else:
         experiment_version = args.experiment_version
 

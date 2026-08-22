@@ -1,58 +1,74 @@
 #!/bin/bash
-# Run [3/3] ONLY. Runs [1/3] and [2/3] were executed on the 24-core/RTX-5090 machine and their
-# checkpoints+logs copied here, so this script no longer re-runs them (2026-08-20). Their commands
-# are preserved commented-out at the bottom for reproducibility.
+# RENAMED 2026-08-22 (from run_experiment_matrix.sh) - the comprehensive independent-aspect
+# ablation matrix (gating/RGB/dilation_ks/whole-tooth/color-dropout/early_bias_power/
+# area_thresholds/both Transformer architectures, 11 runs total) now targets the 4-GPU server
+# instead, split across run_experiment_matrix_gpu0.sh..gpu3.sh (one parallel lane per GPU - see
+# those files' own headers). THIS file is kept as a single-GPU fallback / this-machine reference,
+# not the primary matrix going forward - a smaller 6-run subset of the same axes, still valid to
+# run here if the server isn't available.
 #
-# RESULTS OF THE FIRST TWO RUNS, as copied into this repo - read before trusting [3/3]'s premise:
-# CORRECTED 2026-08-22: the paragraph below originally reported [2/3] as having died mid-epoch
-# 56/99, based on a copy of its log taken while it was still running on the original machine
-# (24-core/RTX-5090). Verified directly from that machine's own TensorBoard event log
-# (logs/tensorboard/patch_dilated_tooth_seg_net/Patch_Seg_17class_gateOn_color_mosaic_tuned_wholetooth/)
-# - [2/3] actually ran to completion:
-#   [1/3] mosaic + tuned thresholds, whole_tooth_patch_prob=0.0
-#         COMPLETED all 100 epochs. Best val_miou=0.7730 @ epoch 84.
-#         (checkpoints/patch_dilated_tooth_seg_net/Patch_Seg_17class_gateOn_color_mosaic_tuned/)
-#         Since extended to 200 epochs on that same machine (resumed via --ckpt, not via this
-#         script - see run_extend_run1_200ep.sh): best val_miou=0.8317 @ epoch 199, still climbing
-#         at the last epoch. Worth knowing before treating 0.7730 as [1/3]'s ceiling.
-#   [2/3] same + whole_tooth_patch_prob=0.3
-#         COMPLETED all 100 epochs (confirmed via TensorBoard's own wall-clock timestamps - 100
-#         val_miou points logged, last one ~13 hours after the first). Best val_miou=0.7471 @
-#         epoch 90 - below [1/3]'s 0.7730 @ 84 at the same 100-epoch budget.
-#         (checkpoints/patch_dilated_tooth_seg_net/Patch_Seg_17class_gateOn_color_mosaic_tuned_wholetooth/)
+# Rewritten 2026-08-22 for THIS machine (24-core / RTX 5090, torch 2.12.1+cu132) - the version
+# previously on disk here was written by a SEPARATE Claude Code session on the 12-core/RTX-3090
+# SERVER box (its `dtsegnet` conda env, ~7-hr/epoch estimates etc. don't apply on this machine).
+# That earlier 3-run matrix (mosaic+tuned-thresholds, +whole-tooth, +dilation_ks) is DONE - see
+# checkpoints/patch_dilated_tooth_seg_net/Patch_Seg_17class_gateOn_color_mosaic_tuned{,_wholetooth,
+# _wholetooth_dilationks}/ - CMD1/CMD2 results below, CMD3 (dilation_ks on top of whole-tooth) was
+# never actually run on this machine; superseded by run [4] below testing dilation_ks in isolation
+# instead of stacked on whole-tooth, now that we have a working RGB/gating/whole-tooth ablation
+# design to be consistent with.
 #
-# *** CAVEAT ON RUNNING [3/3] NOW ***
-# [3/3]'s original design rule was "layer dilation_ks on top of [2/3] ONCE THE FIRST TWO RUNS HAVE
-# SHOWN the tuned-threshold+whole-tooth combination is stable". That precondition IS now met - both
-# completed cleanly - but the RESULT it's conditioned on is a mixed one: whole_tooth_patch_prob=0.3
-# scored below the no-whole-tooth baseline at the same 100-epoch budget (0.7471 vs 0.7730). Whether
-# that's whole-tooth genuinely hurting, or just needing [1/3]'s later-observed extra ~100 epochs to
-# catch up (it hadn't clearly plateaued at epoch 90 either), is unresolved - [2/3] was never
-# extended past 100. [3/3] below still inherits whole_tooth_patch_prob=0.3 from [2/3]'s config
-# regardless. If [3/3] underperforms [1/3], the cause is ambiguous between whole-tooth and
-# dilation_ks - same caveat as before, just no longer blocked on [2/3] finishing.
+# THIS is the real ablation matrix requested 2026-08-22: isolate gating, RGB, and dilation_ks
+# effectiveness (the three open unknowns explicitly asked for), each as ONE change against a
+# single fixed ANCHOR config, at LONG (200-epoch) schedules - run [1]'s own 200-epoch extension
+# (run_extend_run1_200ep.sh) showed val_miou still climbing at epoch 199, not plateaued, so a
+# 100-epoch comparison between any two configs here risks the same "which one would've won at
+# 200?" ambiguity that made run [2]'s (whole-tooth) 100-epoch result inconclusive against run [1].
 #
-# *** RUNTIME ON THIS MACHINE (12-core / RTX 3090) - MUCH SLOWER THAN THE 5090 BOX ***
-# Measured directly with this exact config, 2026-08-20: ~1.0-1.4 s per train batch steady-state
-# (vs the ~0.25 s/batch in [1/3]'s log from the other machine). Projected ~35-40 min/epoch
-# (1200 train + 600 val batches) => ROUGHLY 2.5-3 DAYS for the full 100 epochs, not the ~5 hrs the
-# old header claimed for the 5090 box. The bottleneck is CPU, not the GPU:
-#   - GPU utilization averaged only ~21% (peak VRAM 7.0 GB of 24 GB - memory is NOT a constraint)
-#   - load average 12-21 on 12 cores, i.e. saturated/oversubscribed
-#   - this machine has nproc=12; the machine the header's timings came from has nproc=24
-# num_workers was measured at 5 vs 8 and made no meaningful difference (1.40 vs 1.33 s/batch, within
-# run-to-run noise), so it is left at its default 8. Note persistent_workers=True keeps BOTH the
-# train and val pools alive, so num_workers=8 means 16 live worker processes on 12 cores.
-# Widening dilation_ks is itself ~33% of the per-batch cost (0.75 s/batch at 200/900/1800 vs
-# 1.0 s/batch at 200/1200/3000, same machine) - the rest of the gap is just the smaller box.
+# NOT INCLUDED - deliberately, per explicit direction 2026-08-22: the two new Transformer
+# architectures (models/patch_dilated_tooth_seg_transformer_network.py and
+# ..._transformer_deep_network.py, --architecture dilated_transformer[--add_late_global]) are NOT
+# part of this matrix. They stay as their own standalone runs, launched separately, e.g.:
+#   python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic \
+#     --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 \
+#     --architecture dilated_transformer --epochs 200 \
+#     --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv_transformer
+# (add --add_late_global for the deep variant) - not scripted here since they're explicitly out of
+# scope for this matrix, not because anything about running them differs.
 #
-# Run from the REPO ROOT, inside tmux/screen (a dropped SSH/desktop session over ~3 days will
-# otherwise kill it - which is the most likely explanation for how [2/3] died):
-#   bash run_experiment_matrix.sh
+# ============================================================================================
+# THE ANCHOR CONFIG (every run below changes exactly ONE thing away from this):
+#   17-class, dilation_gating=on, color_style=mosaic (RealisticColorPaintHSV - see
+#   dataset/patch_color_augmentation.py), area_thresholds=20/90/180 (tuned), early_bias_power=1.5
+#   (tuned), whole_tooth_patch_prob=0.0, dilation_ks=200/900/1800 (paper default),
+#   color_dropout_prob=0.0, architecture=dilated (no transformer), 200 epochs.
 #
-# If this run dies, resume it rather than restarting - checkpoints/<experiment_version>/last.ckpt
-# is written every epoch:
-#   python3 train_patch_network_color.py <same flags as CMD3 below> --ckpt <path to last.ckpt>
+# Run [1] below (the anchor itself, tagged _hsv) is NOT just a placeholder baseline - it's a real,
+# open question in its own right: the mosaic color augmentation changed from RealisticColorPaint
+# (independent-per-channel RGB noise) to RealisticColorPaintHSV (correlated hue/sat/val noise)
+# AFTER the existing Patch_Seg_17class_gateOn_color_mosaic_tuned checkpoint (0.8317 @ epoch 199)
+# was trained - see dataset/patch_preprocessing_realistic_color_hsv.py's docstring for why. That
+# checkpoint used the OLD color scheme and is deliberately left alone (not overwritten - see the
+# distinct _hsv-suffixed experiment_version below) so it stays available as a direct before/after
+# comparison point for the color-augmentation fix itself, alongside whatever this matrix finds.
+#
+# RUNTIME (THIS machine, 24-core/RTX 5090): [1]'s own config (tuned thresholds, mosaic color,
+# whole_tooth=0.0) measured ~7:44-7:54/epoch steady-state, 2026-08-19/20 (TensorBoard event-log
+# timestamps, Patch_Seg_17class_gateOn_color_mosaic_tuned's first 3 epochs) - call it ~7:50/epoch,
+# ~26 hours for 200 epochs. [4] (dilation_ks widened) measured ~33% slower per-batch from
+# dilation_ks alone (the OTHER machine's own note, directionally expected to hold here too, exact
+# multiplier not re-measured on THIS box) - budget ~34 hours. The rest are within noise of the
+# anchor's own pace. TOTAL FOR ALL 6 RUNS: roughly 26+27+26+34+26+26 =~ 165 HOURS =~ 7 DAYS
+# of continuous sequential compute. This is a real, substantial commitment - if that's too much,
+# trim runs from the bottom of this file (least-novel-question-first) rather than shortening every
+# run's epoch count, given the plateau problem explained above.
+#
+# Run from the REPO ROOT, inside tmux/screen (a dropped session over multiple days will otherwise
+# kill it):
+#   bash run_experiment_matrix_this_machine.sh
+# If a run dies, resume it rather than restarting - checkpoints/<experiment_version>/last.ckpt is
+# written every epoch:
+#   python3 train_patch_network_color.py <same flags as that run's CMD> --ckpt <path to last.ckpt>
+# ============================================================================================
 
 set -e          # stop the queue on the first failure, don't burn hours on a broken config
 set -o pipefail # WITHOUT this, `python3 ... | tee ...`'s exit status is tee's (always 0), so
@@ -68,57 +84,82 @@ set -o pipefail # WITHOUT this, `python3 ... | tee ...`'s exit status is tee's (
                 # code (verified: propagates true/false/exit N correctly), so set -e/pipefail above
                 # still catch a real crash, not just a wrapper failure.
 
-# Requires the `dtsegnet` conda env (python 3.10 / torch 2.1.0+cu121 / CUDA 12.1 / numba):
-#   conda activate dtsegnet
-# Fail early and loudly rather than 3 days later, or with the system python:
-python3 -c "import torch, numba, lightning; assert torch.cuda.is_available(), 'CUDA not available'" \
-  || { echo "ERROR: wrong/incomplete python env - run 'conda activate dtsegnet' first." >&2; exit 1; }
-
 CKPT_ROOT=checkpoints/patch_dilated_tooth_seg_net
 mkdir -p logs/experiments
 
-echo "[3/3] 17-class, dilation_gating=on, MOSAIC color, area_thresholds=20/90/180 (tuned), early_bias_power=1.5 (tuned), whole_tooth_patch_prob=0.3, dilation_ks=200/1200/3000 (tuned - global-context test)"
-# Same config as [2/3] plus dilation_ks tuning - the axis deliberately deferred from [1/3]/[2/3] to
-# avoid stacking a 3rd untested change on a config with a known crash history. See the CAVEAT above:
-# that deferral condition was never actually satisfied, since [2/3] did not finish.
-# Tests the "more global context could help distinguish tooth 4 from 5 by relative arch position"
-# hypothesis directly - motivated by Docs/REALTIME.md's own premolar-confusion finding (Finding,
-# ~line 855: labels 4/5 and 12/13 repeatedly swap dominance even at area>4000mm^2, where ALL THREE
-# area_thresholds gates are already open - so the confusion persists even with the full dilated
-# context CURRENTLY available, meaning the fix (if there is one on this axis) has to come from
-# WIDENING that context, not just unlocking it earlier).
-#
-# 200/900/1800 are the ORIGINAL PAPER's values (models/dilated_tooth_seg_network.py, untouched),
-# tuned for a fixed 16,000-face full-arch mesh (Docs/TRAINING_CONCERNS.md) - not something this
-# project ever re-derived for our own patch size distribution (a few hundred faces up to
-# --max_faces=20000). dilation_k is the CANDIDATE-neighborhood size each dilated block gathers
-# (via KD-tree, in true metric/mm position) before FPS-downsampling to its actual k=32 graph, i.e.
-# it controls how far in mm a block reaches, not what fraction of the patch it covers - so this
-# widens absolute spatial reach regardless of patch size.
-#   - Block 1 (dilation_ks[0]=200): left UNCHANGED - this is the near-field block, not the one the
-#     "arch position" hypothesis is about.
-#   - Block 2 (dilation_ks[1]=900->1200, +33%): moderate widening.
-#   - Block 3 (dilation_ks[2]=1800->3000, +67%): the block most relevant to the hypothesis gets the
-#     largest increase, since it's already the one active at the exact area regime (>4000mm^2)
-#     where REALTIME.md's finding shows confusion persisting today.
-# Deliberately NOT doubling everything - larger dilation_ks means a larger CPU KD-tree
-# gather+FPS per activated block (models/patch_collate.py), stacked on top of [2/3]'s
-# already-once-crashed-at-these-thresholds config and whole-tooth's own occasionally-larger
-# patches - moderate values first, not a shot in the dark maximized for reach at max crash risk.
-# NB: that CPU KD-tree cost is exactly what the measured 0.75 -> 1.0 s/batch above is.
-CMD3="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.3 --dilation_ks 200 1200 3000 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_wholetooth_dilationks"
-script -qec "$CMD3" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_color_mosaic_tuned_wholetooth_dilationks.log
+ANCHOR_FLAGS="--num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --epochs 200"
 
-echo "Run complete (mosaic + tuned thresholds + whole-tooth curriculum + dilation_ks tuning). Checkpoint under $CKPT_ROOT/Patch_Seg_17class_gateOn_color_mosaic_tuned_wholetooth_dilationks/, log under logs/experiments/."
+echo "[1/6] ANCHOR: tuned thresholds, mosaic color (HSV-fixed), whole_tooth=0.0, dilation_ks default, gating on - 200 epochs"
+# Also the real HSV-color-fix validation - see the header's own note on why this isn't just a
+# placeholder baseline. Everything else below is measured AGAINST this run.
+CMD1="python3 train_patch_network_color.py $ANCHOR_FLAGS --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv"
+script -qec "$CMD1" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_color_mosaic_tuned_hsv.log
+
+echo "[2/6] GATING OFF: dilation_gating=off, everything else = anchor"
+# Tests whether area-gating the 3 dilated blocks (skip a block on patches too small to have
+# reached area_thresholds[i]) is actually earning its keep, or just adding inference-time
+# complexity for no real accuracy gain - dilation_gating=off means all 3 dilated blocks always
+# run regardless of patch area (models/patch_dilated_tooth_seg_network.py's _resolve_gates).
+# Directly answers the "gating effectiveness" question from the 2026-08-22 request.
+CMD2="python3 train_patch_network_color.py --num_classes 17 --dilation_gating off --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --epochs 200 --experiment_version Patch_Seg_17class_gateOff_color_mosaic_tuned_hsv"
+script -qec "$CMD2" /dev/null 2>&1 | tee logs/experiments/17class_gateOff_color_mosaic_tuned_hsv.log
+
+echo "[3/6] RGB ABLATION: color_style=none (feature_dim=24, no color channel at all), everything else = anchor"
+# Tests RGB's actual contribution to accuracy, isolated from every other axis this project has
+# tuned around color (thresholds/whole-tooth/etc. all stay at their tuned values - only the color
+# CHANNEL itself is removed). Uses --color_style none (dataset/patch_preprocessing.py's plain
+# PatchPreTransform, added 2026-08-22 specifically for this run - train_patch_network.py, the
+# original pre-color script, was NOT used: it never received any of the tuned-threshold/whole-
+# tooth/dilation_ks flags added to train_patch_network_color.py over this whole project, so it
+# can't run an apples-to-apples comparison against the anchor's config).
+CMD3="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style none --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --epochs 200 --experiment_version Patch_Seg_17class_gateOn_colorNone_tuned"
+script -qec "$CMD3" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_colorNone_tuned.log
+
+echo "[4/6] DILATION_KS WIDENED: 200/1200/3000 (was 200/900/1800), everything else = anchor"
+# Re-tests the "wider local context helps distinguish arch-position-confused teeth (4 vs 5, 12 vs
+# 13)" hypothesis from Docs/REALTIME.md's premolar-confusion finding, in ISOLATION this time (not
+# stacked on whole-tooth, unlike the earlier deferred CMD3 in this file's history) - block 1
+# (dilation_ks[0]=200) unchanged (near-field, not the block the arch-position hypothesis is
+# about), block 2 900->1200 (+33%), block 3 1800->3000 (+67%, the block already active at the
+# >4000mm^2 area regime where REALTIME.md's confusion persists even with full dilated context).
+# See models/patch_dilated_tooth_seg_network.py's dilation_ks docstring for why 200/900/1800 are
+# the paper's own values, never re-derived for this project's patch distribution.
+CMD4="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --dilation_ks 200 1200 3000 --epochs 200 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv_dilationks"
+script -qec "$CMD4" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_color_mosaic_tuned_hsv_dilationks.log
+
+echo "[5/6] WHOLE-TOOTH CURRICULUM ON: whole_tooth_patch_prob=0.3, everything else = anchor"
+# Re-test of the SAME comparison run [2/3] (old matrix) made at 100 epochs (0.7471 @ 90, below
+# run [1]'s old 0.7730 @ 84) - inconclusive then because neither run had reached its actual
+# ceiling (run [1]'s own 200-epoch extension kept climbing well past epoch 100). This time both
+# the anchor [1/6] and this run get the full 200-epoch budget, so whichever wins does so at a
+# comparable point in each config's own trajectory, not an arbitrary earlier checkpoint.
+CMD5="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.3 --epochs 200 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv_wholetooth"
+script -qec "$CMD5" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_color_mosaic_tuned_hsv_wholetooth.log
+
+echo "[6/6] COLOR DROPOUT ON: color_dropout_prob=0.6, everything else = anchor"
+# Tests the live-deployment robustness fix (dataset/patch_preprocessing_color_dropout.py, added
+# 2026-08-21 after the trimesh process=False bug was found and fixed - see realtime/
+# live_preprocessing.py) at its intended real-world value: --color_dropout_prob applies to BOTH
+# train and val (get_datasets()'s own deliberate choice - see that function's docstring), so
+# val_miou here measures something DIFFERENT from every other run in this matrix (a distribution
+# that includes color-less faces, matching what real live inference actually sees) - NOT directly
+# comparable to the anchor's val_miou number as an apples-to-apples "which config is better" read.
+# The point of this run is to see whether training WITH dropout costs meaningful accuracy on this
+# harder, more realistic validation distribution, not to rank it against the other 5 runs' easier
+# always-has-color val set.
+CMD6="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --color_dropout_prob 0.6 --epochs 200 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv_colordropout"
+script -qec "$CMD6" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_color_mosaic_tuned_hsv_colordropout.log
+
+echo "Matrix complete (anchor, gating-off, RGB-ablation, dilation_ks-widened, whole-tooth-on, color-dropout-on). Checkpoints under $CKPT_ROOT/<experiment_version>/, logs under logs/experiments/."
 
 # ---------------------------------------------------------------------------------------------
-# ALREADY RUN ON THE OTHER MACHINE - kept for reproducibility, intentionally not executed here.
-# Both completed (see the corrected results note near the top of this file) - nothing to resume.
-# To extend [2/3] further the same way [1/3] was (see run_extend_run1_200ep.sh), append
-#   --ckpt checkpoints/patch_dilated_tooth_seg_net/Patch_Seg_17class_gateOn_color_mosaic_tuned_wholetooth/last.ckpt
-#   --epochs 200
-# to CMD2 and run it.
-#
-# CMD1="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned"
-# CMD2="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.3 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_wholetooth"
+# EARLIER MATRIX (2026-08-19/20) - ALREADY RUN, kept for reproducibility, not executed here:
+#   [1/3] mosaic + tuned thresholds, whole_tooth=0.0: COMPLETED 100 epochs, 0.7730 @ 84
+#         (since extended to 200 epochs with the OLD non-HSV color - run_extend_run1_200ep.sh -
+#         0.8317 @ 199, still climbing)
+#   [2/3] same + whole_tooth=0.3: COMPLETED 100 epochs, 0.7471 @ 90
+#   [3/3] same as [2/3] + dilation_ks=200/1200/3000: never run on this machine (superseded by
+#         [4/6] above, which tests dilation_ks against the anchor in isolation instead)
+# OLDCMD1="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned"
+# OLDCMD2="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.3 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_wholetooth"
 # ---------------------------------------------------------------------------------------------

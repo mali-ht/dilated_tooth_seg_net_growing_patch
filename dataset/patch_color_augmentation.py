@@ -106,3 +106,67 @@ class RealisticColorPaint:
         if gum_mask.any():
             colors[gum_mask] = rng.normal(self.gum_mean, self.gum_std, size=(gum_mask.sum(), 3))
         return np.clip(colors, 0, 255).astype(np.uint8)
+
+
+class RealisticColorPaintHSV:
+    """Callable: paint(labels, rng) -> (F, 3) uint8 RGB array.
+
+    Fixes a real problem found in RealisticColorPaint (confirmed 2026-08-22 via
+    testing/visualize_training_input.py, the first time this project actually looked at painted
+    training color rather than just its summary statistics): drawing R, G, B as three
+    INDEPENDENT per-channel Gaussians can - and regularly does - land far enough from the mean on
+    one channel while another goes the opposite way to produce a strongly saturated, wrong-family
+    color for a whole face (a sampled tooth face came out RGB(212,149,231), a visible purple/
+    magenta - no real tooth enamel looks like that). Real tooth/gum color doesn't vary that way:
+    channels move together (a slightly more yellow tooth shifts R and G together, not one up and
+    one down independently), which is exactly what sampling in HSV and converting to RGB
+    enforces - the 3 output channels are correlated by construction, not independent draws.
+
+    Hue is drawn from a narrow, class-appropriate range instead of matching MEASURED_TOOTH/
+    GUM_RGB_MEAN/STD's raw RGB directly - user-directed 2026-08-22: teeth in a warm cream/white/
+    yellowish family, gum in red/pink. (The raw measured tooth mean's OWN computed hue is ~305
+    degrees/magenta-leaning at saturation ~0.02 - meaningless at near-zero saturation, an artifact
+    of which channel is fractionally highest in an essentially-gray color, not a real "true hue"
+    worth reproducing; the gum mean's hue, ~5 degrees/red, IS meaningful at its higher ~0.22
+    saturation and matches the red/pink family directly.) Saturation and value are calibrated so
+    the resulting RGB mean/std land close to MEASURED_TOOTH/GUM_RGB_MEAN/STD's own magnitude
+    (verified directly, not just asserted) - same overall amount of per-face variation as before,
+    just correlated instead of independent.
+
+    label 0 = gum in BOTH the 17-class and 5-class schemes (the 5-class remap keeps 0 -> 0), same
+    as SyntheticColorPaint/RealisticColorPaint.
+    """
+
+    # (hue_mean_deg, hue_std_deg, hue_range_deg, sat_mean, sat_std, sat_range, val_mean, val_std,
+    # val_range) - hue_range is allowed to go negative (e.g. gum's -10) and wraps via mod 360, for
+    # a family straddling 0/360 (red) without needing two disjoint ranges.
+    TOOTH_HSV = dict(hue_mean=48.0, hue_std=8.0, hue_range=(25.0, 65.0),
+                      sat_mean=0.12, sat_std=0.05, sat_range=(0.02, 0.28),
+                      val_mean=0.80, val_std=0.06, val_range=(0.55, 1.0))
+    GUM_HSV = dict(hue_mean=5.0, hue_std=6.0, hue_range=(-10.0, 20.0),
+                   sat_mean=0.30, sat_std=0.10, sat_range=(0.10, 0.60),
+                   val_mean=0.70, val_std=0.08, val_range=(0.45, 0.92))
+
+    def __init__(self, tooth_hsv=TOOTH_HSV, gum_hsv=GUM_HSV):
+        self.tooth_hsv = tooth_hsv
+        self.gum_hsv = gum_hsv
+
+    @staticmethod
+    def _sample_rgb(n, hsv_params, rng):
+        from matplotlib.colors import hsv_to_rgb
+        p = hsv_params
+        h_deg = np.clip(rng.normal(p['hue_mean'], p['hue_std'], n), *p['hue_range'])
+        h = np.mod(h_deg, 360.0) / 360.0
+        s = np.clip(rng.normal(p['sat_mean'], p['sat_std'], n), *p['sat_range'])
+        v = np.clip(rng.normal(p['val_mean'], p['val_std'], n), *p['val_range'])
+        return hsv_to_rgb(np.stack([h, s, v], axis=1)) * 255.0
+
+    def __call__(self, labels: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+        colors = np.zeros((len(labels), 3), dtype=np.float64)
+        tooth_mask = labels != 0
+        gum_mask = ~tooth_mask
+        if tooth_mask.any():
+            colors[tooth_mask] = self._sample_rgb(int(tooth_mask.sum()), self.tooth_hsv, rng)
+        if gum_mask.any():
+            colors[gum_mask] = self._sample_rgb(int(gum_mask.sum()), self.gum_hsv, rng)
+        return np.clip(colors, 0, 255).astype(np.uint8)

@@ -55,6 +55,7 @@ from dataset.patch_color_augmentation import GUM_RGB_HIGH, GUM_RGB_LOW, TOOTH_RG
 # convention as mesh_wire/debug_log/mesh_viewer_linux above, resolves whether this file is run
 # directly (its own dir is auto-added to sys.path) or imported as realtime.mesh_viewer_segmented
 # (replay_guidance.py/test_live_segmenter.py both explicitly add realtime/ to sys.path themselves).
+from live_color_smoothing import TemporalGumClassifier  # noqa: E402
 from live_preprocessing import (NO_COLOR_SENTINEL, cap_face_count, claim_new_voxels,  # noqa: E402
                                  decimate_chunk_worker, downsample_to_density, merge_meshes,
                                  mesh_to_model_inputs, mesh_to_model_inputs_with_color,
@@ -210,7 +211,7 @@ class LiveSegmenter:
 
     def __init__(self, model, device, num_classes=17, target_density=5.0, arch=None, max_model_faces=20000,
                  pool_workers=6, snapshot_dir=None, snapshot_every=1, color_mode='varying',
-                 guidance_confirm_cycles=8):
+                 guidance_confirm_cycles=8, gum_smoothing_alpha=None):
         self.model = model
         self.device = device
         self.num_classes = num_classes
@@ -228,6 +229,7 @@ class LiveSegmenter:
         # either. 'varying' (default) preserves the original real-color-as-is behavior, unchanged.
         self.color_mode = color_mode
         self._flat_colors = None
+        self._gum_classifier = None
         if color_mode == 'flat':
             rng = np.random.default_rng()
             tooth_color = rng.uniform(TOOTH_RGB_LOW, TOOTH_RGB_HIGH).astype(np.uint8)
@@ -235,6 +237,18 @@ class LiveSegmenter:
             self._flat_colors = (tooth_color, gum_color)
             _debug(f"LiveSegmenter init: color_mode=flat - drew tooth_color={tooth_color.tolist()} "
                    f"gum_color={gum_color.tolist()} for the whole scan")
+            # --gum_smoothing_alpha (None by default = old stateless classify_and_flatten_colors,
+            # unchanged): live testing 2026-08-21 showed the per-cycle redness heuristic flickers
+            # badly cycle to cycle (gum% swinging 25%->56%->25%->62% in a handful of cycles) even
+            # though the threshold itself was confirmed near-optimal against pooled real data
+            # (Otsu search: 19.92 vs the existing 20.0 default) - the instability is temporal, not
+            # a bad threshold, so a stateful EMA-smoothed classifier (realtime/
+            # live_color_smoothing.py, NOT YET VERIFIED ON REAL HARDWARE - written on the Linux
+            # side with no scanner attached) is opt-in here rather than replacing the default.
+            if gum_smoothing_alpha is not None:
+                self._gum_classifier = TemporalGumClassifier(alpha=gum_smoothing_alpha)
+                _debug(f"LiveSegmenter init: gum_smoothing_alpha={gum_smoothing_alpha} - using "
+                       f"TemporalGumClassifier instead of the default stateless classifier")
         # Hard cap on the merged mesh actually fed to the model, independent of voxel dedup - see
         # process_once(). Confirmed via real-hardware testing (REALTIME.md): models/patch_layer.py's
         # EdgeGraphConvBlock 2/3 always fall back to an on-the-fly torch.cdist(x_t, x_t) over every
@@ -471,6 +485,21 @@ class LiveSegmenter:
             keep_mask = claim_new_voxels(self._claimed_voxels, down_chunk, self.voxel_size)
             t_dedup += time.time() - t1
             has_colors = down_chunk.visual.kind == 'vertex'
+            # Added 2026-08-21 alongside the "recv mesh frame" colors_bytes logging above - the
+            # Windows scanner PC confirmed real color leaves the vendor DLL on every publish, and
+            # cross-checking received blob_bytes against the expected with/without-color byte
+            # layout confirmed every raw frame ALSO arrives on Linux with real color (791/791
+            # checked, see logs from 2026-08-21). So if has_colors is ever False here, or the
+            # non-sentinel fraction is low, the loss is inside THIS decimate/dedup step
+            # (spatial_split -> decimate_chunk_worker -> downsample_to_density) rather than
+            # further downstream in merge_meshes/_fold_in.
+            if has_colors:
+                vc = np.asarray(down_chunk.visual.vertex_colors)[:, :3]
+                non_sentinel_frac = float((~np.all(vc == NO_COLOR_SENTINEL, axis=1)).mean())
+            else:
+                non_sentinel_frac = 0.0
+            _debug(f"_fold_new_chunks: mesh_id={mesh_id} post-decimate has_colors={has_colors} "
+                   f"non_sentinel_color_fraction={non_sentinel_frac:.3f}")
             kept = trimesh.Trimesh(vertices=down_chunk.vertices, faces=down_chunk.faces[keep_mask], process=False)
             if has_colors:
                 kept.visual.vertex_colors = down_chunk.visual.vertex_colors
@@ -598,7 +627,7 @@ class LiveSegmenter:
         # predicted-class overlay) - unrelated to this, don't conflate the two.
         if self.use_color:
             pos, x, area_mm2, real_face_colors = mesh_to_model_inputs_with_color(
-                down, self.transform, flat_colors=self._flat_colors)
+                down, self.transform, flat_colors=self._flat_colors, classify_fn=self._gum_classifier)
         else:
             pos, x, area_mm2 = mesh_to_model_inputs(down, self.transform)
         t_feature = time.time() - t1
@@ -1245,6 +1274,18 @@ def main():
                           "class-group color structure - an interim mitigation for a confirmed "
                           "training/inference color distribution mismatch (see Docs/REALTIME.md), not "
                           "a fix in itself.")
+    ap.add_argument("--gum_smoothing_alpha", type=float, default=None,
+                     help="Only meaningful with --color_mode flat. None (default): the stateless "
+                          "per-cycle redness classifier, unchanged. A value in (0, 1]: use "
+                          "realtime/live_color_smoothing.py's TemporalGumClassifier instead - "
+                          "EMA-blends each cycle's classification with the nearest spatially- "
+                          "matching face from the previous cycle instead of reclassifying from "
+                          "scratch every time. Lower = smoother/stabler but slower to react to a "
+                          "real gum/tooth boundary; higher = closer to the old per-cycle-only "
+                          "behavior (1.0 is exactly equivalent to not using this at all). Try "
+                          "0.3 as a starting point. NOT YET VERIFIED ON REAL HARDWARE - written "
+                          "2026-08-21 in response to live testing showing gum%% swinging wildly "
+                          "cycle to cycle (e.g. 25%%->56%%->25%%->62%% across a handful of cycles).")
     args = ap.parse_args()
 
     log_path = setup_logging()
@@ -1271,7 +1312,8 @@ def main():
                                target_density=args.target_density, arch=args.arch,
                                max_model_faces=args.max_faces, snapshot_dir=snapshot_dir,
                                snapshot_every=args.snapshot_every, color_mode=args.color_mode,
-                               guidance_confirm_cycles=args.guidance_confirm_cycles)
+                               guidance_confirm_cycles=args.guidance_confirm_cycles,
+                               gum_smoothing_alpha=args.gum_smoothing_alpha)
 
     conn = Conn(args.host, args.port, args.retry)
     viewer = SegmentedViewerApp(lambda cmd: conn.send({"type": "cmd", "cmd": cmd}, b""), segmenter,
@@ -1318,9 +1360,23 @@ def main():
             if t == "mesh":
                 try:
                     parsed = mesh_wire.parse_mesh_payload(header, blob)
+                    # colors_bytes/has_real_color added 2026-08-21 - the Windows-side scanner PC
+                    # confirmed via its own Frida instrumentation that colorsPtr is NEVER null at
+                    # the point of extraction (0/779 sampled) and that the color bytes sent are
+                    # genuinely varied real capture, not a placeholder - yet the Linux-side
+                    # accumulated mesh shows 65-85% of faces with NO real color (matching
+                    # NO_COLOR_SENTINEL, see live_preprocessing.py). That gap has to be somewhere
+                    # between the wire and the accumulator; this is the first, cheapest checkpoint
+                    # on that path (mesh_wire.parse_mesh_payload's own faithfulness was already
+                    # independently reviewed on the Windows side) - logs whether THIS specific
+                    # RECEIVED frame's header already claims colors_bytes==0 (meaning the loss, if
+                    # any, happened before or during transit) vs >0 (meaning the loss is further
+                    # downstream, in update_chunk/decimation/merge/fold).
+                    colors_bytes = header.get("layout", {}).get("colors_bytes")
                     _debug(f"recv mesh frame: mesh_id={parsed['mesh_id']} "
                            f"vertex_count={parsed['vertex_count']} face_count={parsed['face_count']} "
-                           f"blob_bytes={len(blob)} seq={parsed.get('seq')} "
+                           f"blob_bytes={len(blob)} colors_bytes={colors_bytes} "
+                           f"has_real_color={parsed.get('colors') is not None} seq={parsed.get('seq')} "
                            f"recv_blocked={recv_blocked_s:.3f}s gap_since_last_frame={gap_since_last_frame_s:.3f}s"
                            f"{gap_tag} (totals so far: {frame_count})")
                     viewer.push_raw(parsed)

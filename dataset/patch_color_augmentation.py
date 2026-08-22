@@ -17,6 +17,18 @@ import numpy as np
 # realistic teeth-vs-gum color signal without this augmentation needing to track individual tooth
 # identity.
 
+# Same value as realtime/live_preprocessing.py's NO_COLOR_SENTINEL (and
+# realtime/analyze_snapshot_colors.py's own inlined copy of it) - duplicated here rather than
+# imported for the same reason analyze_snapshot_colors.py gives: dataset/ shouldn't depend on
+# realtime/'s own sys.path setup. What the live scanner's wire protocol sends for a face with NO
+# real captured color at all (realtime/Windows_server/mesh_intercept.js: colorsBytes=0 whenever
+# the vendor DLL's own color pointer is null for that publish) - confirmed empirically
+# (analyze_snapshot_colors.py, 2026-08-21) that 65-88% of faces in a real live scan carry this
+# value, and that a color-trained checkpoint reads it as far darker than either real class range
+# below, causing it to default to gum almost unconditionally on this sentinel value (99.9% gum
+# rate in one live run). See dataset/patch_preprocessing_color_dropout.py.
+NO_COLOR_SENTINEL = np.array([102, 102, 102], dtype=np.uint8)
+
 # RGB ranges (0-255). Confirmed values (user-approved), not placeholders.
 TOOTH_RGB_LOW = np.array([210, 200, 175], dtype=np.float32)   # white/cream
 TOOTH_RGB_HIGH = np.array([245, 235, 215], dtype=np.float32)

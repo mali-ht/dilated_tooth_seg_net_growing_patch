@@ -94,6 +94,13 @@ Two axes of partialness + supporting pieces:
 19. [ ] Ingestion adapter: scanner arrays → per-face feature builder; resample to W.
 20. [ ] (Optional) per-voxel label grid for temporal stabilization.
 21. [ ] (Later) Exploit real RGB color — blocked by Teeth3DS lacking real color.
+22. [ ] (Later, once architecture + training regimen are settled) Final retrain on the FULL labeled
+    Teeth3DS pool: combine `training_{lower,upper}.txt` (1200) + `testing_{lower,upper}.txt` (600) =
+    1800 patients, no held-out val split. train/test_split=1's 600-patient val set is for comparing
+    configs during the experiment-matrix phase; once a config is locked in, retrain it once on
+    train+val combined to use the data currently being "spent" on validation. Does NOT include the
+    other 100 Teeth3DS patients (the 3DTeethLand official test set) — confirmed 2026-08-20 those have
+    a mesh but no segmentation `.json` label at all, so they're unusable for this task regardless.
 
 ## Open design questions
 - Frida hook for the DLL's WHOLE unified mesh at once (vs reassembling tiles)?

@@ -42,6 +42,7 @@ from dataset.patch_dataset_whole_tooth import DEFAULT_MARGIN_MM, PatchTeeth3DSDa
 from dataset.patch_face_cap import DEFAULT_MAX_FACES, MaxFaceCapTransform
 from dataset.patch_losses import compute_class_alpha
 from dataset.patch_preprocessing_color import PatchPreTransformWithColor
+from dataset.patch_preprocessing_color_dropout import ColorDropoutWrapper
 from dataset.patch_preprocessing_realistic_color import PatchPreTransformWithRealisticColor
 from models.patch_collate import PatchCollator
 from models.patch_lightning_module import PatchLitDilatedToothSegmentationNetwork
@@ -111,14 +112,20 @@ seed_everything(SEED, workers=True)
 
 
 def get_datasets(root, processed_folder, train_test_split, num_classes, early_bias_power, max_faces,
-                  color_style='flat', whole_tooth_patch_prob=0.3, whole_tooth_margin_mm=DEFAULT_MARGIN_MM):
+                  color_style='flat', whole_tooth_patch_prob=0.3, whole_tooth_margin_mm=DEFAULT_MARGIN_MM,
+                  color_dropout_prob=0.0):
     color_transform_cls = {
         'flat': PatchPreTransformWithColor,
         'mosaic': PatchPreTransformWithRealisticColor,
     }[color_style]
 
     def make_transform():
-        return MaxFaceCapTransform(color_transform_cls(classes=num_classes), max_faces=max_faces)
+        inner = color_transform_cls(classes=num_classes)
+        # 0.0 (default): unchanged from before this flag existed - no wrapper, byte-identical
+        # behavior. See dataset/patch_preprocessing_color_dropout.py for why this exists at all.
+        if color_dropout_prob > 0.0:
+            inner = ColorDropoutWrapper(inner, dropout_prob=color_dropout_prob)
+        return MaxFaceCapTransform(inner, max_faces=max_faces)
 
     # PatchTeeth3DSDatasetWithWholeTooth (dataset/patch_dataset_whole_tooth.py, additive subclass -
     # PatchTeeth3DSDataset itself untouched): at whole_tooth_patch_prob=0.0 every draw still takes
@@ -238,6 +245,23 @@ if __name__ == "__main__":
                               "dataset/patch_color_augmentation.py. Added 2026-08-19 after "
                               "confirming empirically that flat's zero intra-class variance, not "
                               "just its color values, was itself hurting live hardware accuracy.")
+    parser.add_argument('--color_dropout_prob', type=float, default=0.0,
+                         help='Fraction of faces per patch whose color is overwritten with the '
+                              'live no-color sentinel (dataset/patch_preprocessing_color_dropout.py) '
+                              'instead of the color_style-painted value. 0.0 (default): unchanged, '
+                              'no dropout. Added 2026-08-21 after live hardware confirmed a '
+                              'color-trained checkpoint reads real live color-lessness (65-88%% of '
+                              'faces in a real scan, per analyze_snapshot_colors.py) as strongly '
+                              'gum-like, since training never once produced a color-less face for '
+                              'it to learn to discount. Applied to BOTH train and val (this flag '
+                              'changes what make_transform() returns identically for both datasets '
+                              'in get_datasets() below) - deliberately, not an oversight: a val set '
+                              'with 100%% valid color would keep measuring a distribution real '
+                              'inference never sees, the same disconnect that made val_miou blind '
+                              'to the live gum over-prediction in the first place. This means '
+                              'val_miou from a --color_dropout_prob > 0 run is NOT directly '
+                              'comparable to earlier runs (0.0) - expect a lower number that means '
+                              'something closer to real deployment, not a regression.')
 
     args = parser.parse_args()
 
@@ -246,7 +270,7 @@ if __name__ == "__main__":
     train_dataset, val_dataset = get_datasets(args.root, args.processed_folder, args.train_test_split,
                                                args.num_classes, args.early_bias_power, args.max_faces,
                                                args.color_style, args.whole_tooth_patch_prob,
-                                               args.whole_tooth_margin_mm)
+                                               args.whole_tooth_margin_mm, args.color_dropout_prob)
 
     class_alpha = None
     if not args.no_class_weights:

@@ -121,7 +121,23 @@ def downsample_to_density(mesh: trimesh.Trimesh, target_density: float = 5.0,
         rng = np.random.default_rng()
         keep = rng.choice(len(mesh_simple.faces), size=target_count, replace=False)
         kept_colors = mesh_simple.visual.vertex_colors if vertex_colors is not None else None
-        mesh_simple = trimesh.Trimesh(vertices=mesh_simple.vertices, faces=mesh_simple.faces[keep])
+        # BUG FIXED 2026-08-21 (root cause of the live "65-85% of faces have no real color"
+        # finding - see Docs/REALTIME.md): this constructor call was missing process=False, the
+        # one thing that made "same vertex buffer, only faces changed" (the comment below,
+        # already the intended behavior) actually true. Without it, trimesh defaults to
+        # process=True and silently drops now-unreferenced vertices (some of mesh_simple's
+        # vertices aren't touched by the `keep` face subset) - changing len(mesh_simple.vertices),
+        # so kept_colors (captured above, sized to the OLD vertex count) no longer matched on
+        # assignment below. Verified empirically this exact shape mismatch makes trimesh silently
+        # fall back to its own default vertex color, [102,102,102] - which is EXACTLY
+        # NO_COLOR_SENTINEL, so the corrupted output was indistinguishable from genuinely-missing
+        # scanner color at every downstream check, including this project's own diagnostics. Real
+        # per-vertex captured color was being computed correctly and arriving over the wire the
+        # whole time (confirmed independently via the Windows-side Frida instrumentation AND a
+        # Linux-side blob-size cross-check, both 2026-08-21) - this was purely a downstream
+        # reconstruction bug in this one branch, only triggered when a chunk's decimated face
+        # count still exceeded target_count after quadric decimation (the "overshoot" case).
+        mesh_simple = trimesh.Trimesh(vertices=mesh_simple.vertices, faces=mesh_simple.faces[keep], process=False)
         if kept_colors is not None:
             mesh_simple.visual.vertex_colors = kept_colors  # same vertex buffer, only faces changed
         _debug(f"downsample_to_density: trimmed decimation overshoot {len(keep)} -> {target_count} "
@@ -412,7 +428,7 @@ def mesh_to_model_inputs(mesh: trimesh.Trimesh, transform: PatchPreTransform):
 
 
 def mesh_to_model_inputs_with_color(mesh: trimesh.Trimesh, transform: PatchPreTransformWithRealColor,
-                                     flat_colors: tuple = None):
+                                     flat_colors: tuple = None, classify_fn=None):
     """Same as mesh_to_model_inputs, for a checkpoint trained with real per-face color
     (dataset/patch_preprocessing_color.py's PatchPreTransformWithColor, feature_dim=27) instead of
     the original 24-dim geometry-only layout. mesh must carry mesh.visual.vertex_colors (real
@@ -427,10 +443,17 @@ def mesh_to_model_inputs_with_color(mesh: trimesh.Trimesh, transform: PatchPreTr
 
     flat_colors: optional (tooth_color, gum_color) pair - when given, --color_mode flat
     (mesh_viewer_segmented.py): the real per-face color is classified and repainted via
-    classify_and_flatten_colors before being fed to the model, but the RETURNED face_colors is
-    still the real, unflattened value - snapshots (see _save_snapshot) should always record what
-    the scanner actually captured, for checking the real distribution, regardless of which mode
-    the model itself is being fed.
+    classify_fn (classify_and_flatten_colors by default) before being fed to the model, but the
+    RETURNED face_colors is still the real, unflattened value - snapshots (see _save_snapshot)
+    should always record what the scanner actually captured, for checking the real distribution,
+    regardless of which mode the model itself is being fed.
+
+    classify_fn: optional override for the flat_colors classifier, same call signature as
+    classify_and_flatten_colors(face_colors, face_centroids, tooth_color, gum_color) -> (F,3)
+    uint8. None (default): classify_and_flatten_colors, unchanged from before this parameter
+    existed. Extension point for realtime/live_color_smoothing.py's TemporalGumClassifier - a
+    stateful classifier needs to be constructed once and reused across cycles (to carry its own
+    history), which a plain function reference can't do on its own.
 
     Returns (pos, x, area_mm2, face_colors) - the extra face_colors (F, 3) uint8 return (vs.
     mesh_to_model_inputs's 3-tuple) is what actually got fed to the model this cycle, for
@@ -455,7 +478,8 @@ def mesh_to_model_inputs_with_color(mesh: trimesh.Trimesh, transform: PatchPreTr
     fed_colors = face_colors
     if flat_colors is not None:
         tooth_color, gum_color = flat_colors
-        fed_colors = classify_and_flatten_colors(face_colors, mesh.triangles_center, tooth_color, gum_color)
+        fn = classify_fn if classify_fn is not None else classify_and_flatten_colors
+        fed_colors = fn(face_colors, mesh.triangles_center, tooth_color, gum_color)
 
     raw = (mesh_faces, mesh_triangles, mesh_vertices_normals, mesh_face_normals, dummy_labels)
     pos, x, _ = transform(raw, fed_colors)

@@ -4,27 +4,33 @@
 # are preserved commented-out at the bottom for reproducibility.
 #
 # RESULTS OF THE FIRST TWO RUNS, as copied into this repo - read before trusting [3/3]'s premise:
+# CORRECTED 2026-08-22: the paragraph below originally reported [2/3] as having died mid-epoch
+# 56/99, based on a copy of its log taken while it was still running on the original machine
+# (24-core/RTX-5090). Verified directly from that machine's own TensorBoard event log
+# (logs/tensorboard/patch_dilated_tooth_seg_net/Patch_Seg_17class_gateOn_color_mosaic_tuned_wholetooth/)
+# - [2/3] actually ran to completion:
 #   [1/3] mosaic + tuned thresholds, whole_tooth_patch_prob=0.0
 #         COMPLETED all 100 epochs. Best val_miou=0.7730 @ epoch 84.
 #         (checkpoints/patch_dilated_tooth_seg_net/Patch_Seg_17class_gateOn_color_mosaic_tuned/)
+#         Since extended to 200 epochs on that same machine (resumed via --ckpt, not via this
+#         script - see run_extend_run1_200ep.sh): best val_miou=0.8317 @ epoch 199, still climbing
+#         at the last epoch. Worth knowing before treating 0.7730 as [1/3]'s ceiling.
 #   [2/3] same + whole_tooth_patch_prob=0.3
-#         *** DID NOT COMPLETE *** - its log stops dead mid-epoch 56/99 at batch 591/1200 with no
-#         traceback, no CUDA error and no Lightning shutdown line (i.e. the process was killed
-#         abruptly - SIGKILL/OOM-killer/host died - NOT the torch.AcceleratorError launch-timeout
-#         that killed the earlier 17class_gateOn_color_tuned run at a coincidentally similar
-#         epoch). Best val_miou=0.6695 @ epoch 54.
+#         COMPLETED all 100 epochs (confirmed via TensorBoard's own wall-clock timestamps - 100
+#         val_miou points logged, last one ~13 hours after the first). Best val_miou=0.7471 @
+#         epoch 90 - below [1/3]'s 0.7730 @ 84 at the same 100-epoch budget.
 #         (checkpoints/patch_dilated_tooth_seg_net/Patch_Seg_17class_gateOn_color_mosaic_tuned_wholetooth/)
 #
 # *** CAVEAT ON RUNNING [3/3] NOW ***
 # [3/3]'s original design rule was "layer dilation_ks on top of [2/3] ONCE THE FIRST TWO RUNS HAVE
-# SHOWN the tuned-threshold+whole-tooth combination is stable". That precondition is NOT met:
-# [2/3] never finished, and at the epoch it died its val_miou (0.6695 @ 54) was still well BELOW
-# [1/3]'s (0.7730 @ 84) - though that comparison is not conclusive either, since [1/3] needed until
-# epoch 84 to reach its best, and [2/3] never got past 56. So whole_tooth_patch_prob=0.3 is
-# currently UNPROVEN, not proven-good - and [3/3] below inherits it. If [3/3] underperforms [1/3],
-# the cause is ambiguous between the whole-tooth curriculum and dilation_ks. Finishing [2/3] first
-# (resume from its last.ckpt, see below) would disambiguate; running [3/3] now trades that
-# cleanliness for wall-clock. Deliberate choice - just don't read a bad [3/3] as "dilation_ks bad".
+# SHOWN the tuned-threshold+whole-tooth combination is stable". That precondition IS now met - both
+# completed cleanly - but the RESULT it's conditioned on is a mixed one: whole_tooth_patch_prob=0.3
+# scored below the no-whole-tooth baseline at the same 100-epoch budget (0.7471 vs 0.7730). Whether
+# that's whole-tooth genuinely hurting, or just needing [1/3]'s later-observed extra ~100 epochs to
+# catch up (it hadn't clearly plateaued at epoch 90 either), is unresolved - [2/3] was never
+# extended past 100. [3/3] below still inherits whole_tooth_patch_prob=0.3 from [2/3]'s config
+# regardless. If [3/3] underperforms [1/3], the cause is ambiguous between whole-tooth and
+# dilation_ks - same caveat as before, just no longer blocked on [2/3] finishing.
 #
 # *** RUNTIME ON THIS MACHINE (12-core / RTX 3090) - MUCH SLOWER THAN THE 5090 BOX ***
 # Measured directly with this exact config, 2026-08-20: ~1.0-1.4 s per train batch steady-state
@@ -107,8 +113,10 @@ echo "Run complete (mosaic + tuned thresholds + whole-tooth curriculum + dilatio
 
 # ---------------------------------------------------------------------------------------------
 # ALREADY RUN ON THE OTHER MACHINE - kept for reproducibility, intentionally not executed here.
-# To finish the incomplete [2/3] (recommended before drawing conclusions from [3/3]), append
+# Both completed (see the corrected results note near the top of this file) - nothing to resume.
+# To extend [2/3] further the same way [1/3] was (see run_extend_run1_200ep.sh), append
 #   --ckpt checkpoints/patch_dilated_tooth_seg_net/Patch_Seg_17class_gateOn_color_mosaic_tuned_wholetooth/last.ckpt
+#   --epochs 200
 # to CMD2 and run it.
 #
 # CMD1="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned"

@@ -1,50 +1,69 @@
---extra-index-url https://download.pytorch.org/whl/cu121
-torch==2.1.0+cu121
-torchaudio==2.1.0+cu121
-torchdata==0.7.0
-torchtext==0.16.0+cpu
-torchvision==0.16.0+cu121
-matplotlib==3.7.3
-seaborn==0.13.0
-pandas==2.0.3
-numpy==1.24.4
-scikit-learn==1.2.2
-mlxtend==0.23.0
-nltk==3.8.1
-jupyterlab==4.0.6
-tqdm==4.66.1
-ipywidgets==8.1.1
-tensorboard==2.14.0
-scikit-image==0.21.0
-Pillow==10.1.0
-opencv-python==4.8.1.78
-streamlit==1.27.2
-lightning==2.1.0
-imgaug==0.4.0
-trimesh==4.0.10
-pyfqmr==0.2.0
+--extra-index-url https://download.pytorch.org/whl/cu128
 
-# --- added 2026-08-20, see Docs/SETUP.md ---
+# =============================================================================================
+# MIGRATED 2026-08-22: torch 2.1.0+cu121 -> torch 2.8.0+cu128, for Blackwell (sm_120) GPUs.
+#
+# WHY: CUDA 12.1 emits native SASS for sm_50..sm_90 only. On Blackwell hardware (RTX PRO 6000
+# Blackwell and RTX 5090 are both sm_120) the old pins install cleanly and even report
+# torch.cuda.is_available() == True, then fail on real kernel launches - cuBLAS/cuDNN ship
+# precompiled SASS that cannot PTX-JIT forward. torch 2.8.0+cu128 carries native sm_120 SASS.
+# Docs/SETUP.md called this out in advance under "GPUs newer than CUDA 12.1".
+#
+# These pins are coupled to setup_server.sh's CUDA_VERSION / GCC_VERSION / MIN_DRIVER /
+# PY_VERSION constants and its Phase 7 verification block. Change them together or not at all.
+#
+# ALSO REMOVED 2026-08-22: torchaudio, torchtext, torchdata, torchvision, pandas, seaborn,
+# mlxtend, nltk, jupyterlab, ipywidgets, streamlit, scikit-learn, scikit-image, opencv-python,
+# Pillow and imgaug. A repo-wide import scan (all tracked .py; there are no notebooks) shows not
+# one of them is imported anywhere. They were dead weight inherited from the upstream template,
+# and several of them - imgaug and scikit-image especially - are what made the numpy/numba
+# co-pinning painful. Re-add individually if a future module genuinely needs one.
+# =============================================================================================
+
+torch==2.8.0+cu128
+
+# --- numeric core ---------------------------------------------------------------------------
+# numpy stays on the 1.x line deliberately. The code was written against 1.24 and a scan found
+# no numpy-2-removed APIs, but 1.26.4 keeps the blast radius at zero while still satisfying
+# numba 0.61.2 (numpy>=1.24,<2.3) and scipy 1.15.3 (numpy>=1.23.5).
+numpy==1.26.4
+scipy==1.15.3
 
 # REQUIRED, not optional: models/patch_collate.py imports numba at module level, so every
 # train_patch_network*.py run dies at import with ModuleNotFoundError without it. It was missing
 # from this file until 2026-08-20 even though the code has always depended on it.
-# Pinned to 0.58.x on purpose: numba constrains numpy, and the unpinned/newer releases resolve
-# numpy above the 1.24.4 pinned above, which in turn breaks the torch 2.1.0+cu121 ABI.
-# 0.58.1 declares numpy>=1.22,<1.27, so it accepts 1.24.4 and leaves it untouched.
-numba==0.58.1
+# 0.61.2 is the numba contemporary with torch 2.8; it supports python 3.11 and numpy 1.26.
+numba==0.61.2
 
-# lightning 2.1.0 calls pkg_resources.declare_namespace() at import time. pkg_resources was
-# deprecated in setuptools 81 and REMOVED in 82, so a modern setuptools (conda/venv ship 80+ now)
-# makes `import lightning` fail with ModuleNotFoundError: No module named 'pkg_resources'.
-# The deprecation warning this prints on every run is expected and harmless.
-setuptools<81
+# --- training -------------------------------------------------------------------------------
+lightning==2.5.6
+torchmetrics==1.7.4
+tensorboard==2.20.0
+
+# NOTE: the `setuptools<81` pin that lived here is GONE. It existed because lightning 2.1.0
+# called pkg_resources.declare_namespace() at import time, which setuptools 82 removed.
+# lightning 2.5.6 does not touch pkg_resources, so the pin (and the deprecation warning it
+# printed on every single run) is no longer needed.
+
+# --- meshes / geometry ----------------------------------------------------------------------
+trimesh==4.6.13
+pyfqmr==0.2.0
+
+# --- misc -----------------------------------------------------------------------------------
+matplotlib==3.10.9
+tqdm==4.67.1
 
 # Used by torch.utils.cpp_extension to build pointnet2_ops_lib's CUDA extension in parallel.
 # Not strictly required (there is a much slower serial fallback), but the upstream README and
 # Dockerfile both install it before building, so keep it here to make that a one-step install.
-# NOTE: `pip check` reports "ninja 1.11.1.1 is not supported on this platform" for this wheel.
+# NOTE: `pip check` may report "ninja ... is not supported on this platform" for this wheel.
 # That is a cosmetic defect in ninja's own wheel metadata, NOT a broken install - the shipped
-# binary runs fine (`ninja --version` -> 1.11.1.git.kitware.jobserver-1 on x86_64 Linux).
-# Verified 2026-08-20; do not gate an automated install on a clean `pip check` because of it.
+# binary runs fine. Do not gate an automated install on a clean `pip check` because of it.
 ninja==1.11.1.1
+
+# --- optional: realtime viewer only ----------------------------------------------------------
+# realtime/ and the mesh viewers import open3d and pyvista. Nothing in the training path does,
+# and they are large GUI-stack dependencies, so they are left out of the server install.
+# Uncomment on a workstation where you actually want the viewer:
+# open3d
+# pyvista

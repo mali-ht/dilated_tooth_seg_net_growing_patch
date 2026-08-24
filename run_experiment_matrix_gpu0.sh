@@ -48,7 +48,7 @@
 # Run from the REPO ROOT, inside tmux/screen (a dropped session over multiple days will otherwise
 # kill it): bash run_experiment_matrix_gpu0.sh
 # If a run dies, resume rather than restart - checkpoints/<experiment_version>/last.ckpt is
-# written every epoch: python3 train_patch_network_color.py <same flags> --ckpt <path>
+# written every epoch: python3 train_patch_network_color.py --num_workers 20 <same flags> --ckpt <path>
 # ============================================================================================
 
 set -e
@@ -67,7 +67,19 @@ echo "[gpu0 1/2] DILATION_KS WIDENED: 200/1200/3000 (was 200/900/1800), everythi
 # paper's own values, never re-derived for this project's patch distribution. Heaviest single run
 # in the whole matrix (~33% more expensive per batch, measured on the dev machine) - given its
 # own lane here rather than paired with another heavy run.
-CMD1="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --dilation_ks 200 1200 3000 --epochs 200 --devices 0 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv_dilationks"
+# --------------------------------------------------------------------------------------------
+# --num_workers 20 (added 2026-08-22, server deployment): the script's own default of 8 was tuned
+# on the 24-core dev machine, alongside the NUMBA_NUM_THREADS=1 fix documented at the top of
+# train_patch_network_color.py ("concurrency should come from num_workers"). This server has 128
+# cores. Measured on the first launch attempt with the default 8: 4 lanes x 8 train workers = 32
+# active worker processes, GPUs averaging 4-17% utilisation, 58% of CPU idle and %wa = 0.0 (so
+# starved by the collate pipeline, not by disk). 20 per lane puts 80 of 128 cores to work while
+# leaving headroom for the 4 main processes and for each lane's persistent val worker pool waking
+# up during validation. Raise further only with the same measurement in hand - the header comment
+# in train_patch_network_color.py documents what over-subscription looked like when it went wrong.
+# --------------------------------------------------------------------------------------------
+
+CMD1="python3 train_patch_network_color.py --num_workers 20 --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --dilation_ks 200 1200 3000 --epochs 200 --devices 0 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv_dilationks"
 script -qec "$CMD1" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_color_mosaic_tuned_hsv_dilationks.log
 
 echo "[gpu0 2/2] COLOR DROPOUT ON: color_dropout_prob=0.6, everything else = anchor"
@@ -79,7 +91,7 @@ echo "[gpu0 2/2] COLOR DROPOUT ON: color_dropout_prob=0.6, everything else = anc
 # sees) - NOT directly comparable to the anchor's val_miou as an apples-to-apples ranking. The
 # point is whether training WITH dropout costs meaningful accuracy on this harder distribution,
 # not to rank it against the other 10 runs' easier always-has-color val set.
-CMD2="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --color_dropout_prob 0.6 --epochs 200 --devices 0 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv_colordropout"
+CMD2="python3 train_patch_network_color.py --num_workers 20 --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --color_dropout_prob 0.6 --epochs 200 --devices 0 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv_colordropout"
 script -qec "$CMD2" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_color_mosaic_tuned_hsv_colordropout.log
 
 echo "[gpu0] lane complete. Checkpoints under $CKPT_ROOT/<experiment_version>/, logs under logs/experiments/."

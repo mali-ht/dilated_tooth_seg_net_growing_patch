@@ -28,7 +28,19 @@ echo "[gpu3 1/3] ANCHOR: tuned thresholds, mosaic color (HSV-fixed), whole_tooth
 # OLD color scheme and is deliberately left alone (this run uses a distinct _hsv-suffixed
 # experiment_version) so it stays available as a direct before/after comparison for the color fix
 # itself, independent of whatever this matrix finds.
-CMD1="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --epochs 200 --devices 3 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv"
+# --------------------------------------------------------------------------------------------
+# --num_workers 20 (added 2026-08-22, server deployment): the script's own default of 8 was tuned
+# on the 24-core dev machine, alongside the NUMBA_NUM_THREADS=1 fix documented at the top of
+# train_patch_network_color.py ("concurrency should come from num_workers"). This server has 128
+# cores. Measured on the first launch attempt with the default 8: 4 lanes x 8 train workers = 32
+# active worker processes, GPUs averaging 4-17% utilisation, 58% of CPU idle and %wa = 0.0 (so
+# starved by the collate pipeline, not by disk). 20 per lane puts 80 of 128 cores to work while
+# leaving headroom for the 4 main processes and for each lane's persistent val worker pool waking
+# up during validation. Raise further only with the same measurement in hand - the header comment
+# in train_patch_network_color.py documents what over-subscription looked like when it went wrong.
+# --------------------------------------------------------------------------------------------
+
+CMD1="python3 train_patch_network_color.py --num_workers 20 --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --epochs 200 --devices 3 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv"
 script -qec "$CMD1" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_color_mosaic_tuned_hsv.log
 
 echo "[gpu3 2/3] GATING OFF: dilation_gating=off, everything else = anchor"
@@ -36,7 +48,7 @@ echo "[gpu3 2/3] GATING OFF: dilation_gating=off, everything else = anchor"
 # reached area_thresholds[i] - models/patch_dilated_tooth_seg_network.py's _resolve_gates) is
 # actually earning its keep, or just adding inference-time complexity for no real accuracy gain.
 # dilation_gating=off means all 3 dilated blocks always run regardless of patch area.
-CMD2="python3 train_patch_network_color.py --num_classes 17 --dilation_gating off --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --epochs 200 --devices 3 --experiment_version Patch_Seg_17class_gateOff_color_mosaic_tuned_hsv"
+CMD2="python3 train_patch_network_color.py --num_workers 20 --num_classes 17 --dilation_gating off --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --epochs 200 --devices 3 --experiment_version Patch_Seg_17class_gateOff_color_mosaic_tuned_hsv"
 script -qec "$CMD2" /dev/null 2>&1 | tee logs/experiments/17class_gateOff_color_mosaic_tuned_hsv.log
 
 echo "[gpu3 3/3] RGB ABLATION: color_style=none (feature_dim=24, no color channel at all), everything else = anchor"
@@ -47,7 +59,7 @@ echo "[gpu3 3/3] RGB ABLATION: color_style=none (feature_dim=24, no color channe
 # train_patch_network.py, was NOT used since it never received any of the tuned-threshold/
 # whole-tooth/dilation_ks flags added to train_patch_network_color.py over this project's
 # history, so it can't run an apples-to-apples comparison against the anchor's config).
-CMD3="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style none --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --epochs 200 --devices 3 --experiment_version Patch_Seg_17class_gateOn_colorNone_tuned"
+CMD3="python3 train_patch_network_color.py --num_workers 20 --num_classes 17 --dilation_gating on --color_style none --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --epochs 200 --devices 3 --experiment_version Patch_Seg_17class_gateOn_colorNone_tuned"
 script -qec "$CMD3" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_colorNone_tuned.log
 
 echo "[gpu3] lane complete. Checkpoints under $CKPT_ROOT/<experiment_version>/, logs under logs/experiments/."

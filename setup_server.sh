@@ -25,10 +25,11 @@ set -euo pipefail
 ENV_NAME="${ENV_NAME:-dtsegnet}"
 ENV_PREFIX=""                # explicit path for the env; auto-chosen if empty
 CONDA_ROOT="${CONDA_ROOT:-}" # auto-detected if empty
-PY_VERSION=3.10
-CUDA_VERSION=12.1.1          # must stay consistent with requirements.txt's torch ...+cu121
-GCC_VERSION=12               # CUDA 12.1's nvcc rejects gcc >= 13
-MIN_DRIVER=525.60.13         # minimum driver for CUDA 12.1 runtime (CUDA 12.x minor-version compat)
+PY_VERSION=3.11
+CUDA_VERSION=12.8.1          # must stay consistent with requirements.txt's torch ...+cu128
+GCC_VERSION=13               # CUDA 12.8's nvcc accepts gcc <= 14
+MIN_DRIVER=570.26            # minimum driver that supports Blackwell / sm_120 at all
+MAX_NATIVE_CAP=12.0          # highest compute capability CUDA 12.8 emits native SASS for
 MINICONDA_URL=https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -86,11 +87,11 @@ if nvidia-smi >/dev/null 2>&1; then
   driver_ver="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)"
   info "found  : driver $driver_ver  ($(nvidia-smi --query-gpu=name --format=csv,noheader | head -1))"
   info "         LEAVING IT ALONE - this script never modifies an existing driver."
-  # torch 2.1.0+cu121 needs a driver new enough for the CUDA 12.1 runtime. Newer is always fine
+  # torch 2.8.0+cu128 needs a driver new enough for the CUDA 12.8 runtime. Newer is always fine
   # (drivers are backwards compatible); older means torch cannot initialise CUDA at all.
   if [[ "$(printf '%s\n%s\n' "$MIN_DRIVER" "$driver_ver" | sort -V | head -1)" != "$MIN_DRIVER" ]]; then
-    warn "Driver $driver_ver is OLDER than $MIN_DRIVER, the minimum for the CUDA 12.1 runtime that
-   torch 2.1.0+cu121 needs. torch will fail to initialise CUDA. Updating the driver is a system
+    warn "Driver $driver_ver is OLDER than $MIN_DRIVER, the minimum for the CUDA 12.8 runtime that
+   torch 2.8.0+cu128 needs. torch will fail to initialise CUDA. Updating the driver is a system
    change this script deliberately will not make - talk to whoever administers the machine."
   fi
 elif [[ $WITH_DRIVER -eq 1 ]]; then
@@ -135,14 +136,14 @@ if nvidia-smi >/dev/null 2>&1; then
   mapfile -t caps < <(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d ' ' | sort -u)
   if [[ ${#caps[@]} -gt 0 ]]; then
     info "compute capability: ${caps[*]}"
-    # CUDA 12.1 emits native SASS for sm_50..sm_90 only. Blackwell (RTX 50xx = sm_120,
-    # B200 = sm_100) can run solely via PTX JIT, hence the '+PTX' suffix - slow to start and
-    # not guaranteed. Warn rather than fail obscurely later.
+    # CUDA 12.8 emits native SASS up to sm_120, which covers Blackwell (RTX 50xx and RTX PRO
+    # 6000 Blackwell = sm_120, B200 = sm_100). Anything newer than that can run solely via PTX
+    # JIT, hence the '+PTX' suffix - slow to start and not guaranteed. Warn, don't fail.
     highest="$(printf '%s\n' "${caps[@]}" | sort -V | tail -1)"
-    if [[ "$(printf '%s\n9.0\n' "$highest" | sort -V | tail -1)" != "9.0" && "$highest" != "9.0" ]]; then
-      warn "Compute capability $highest is NEWER than CUDA ${CUDA_VERSION%.*} supports natively (max sm_90).
-   The build falls back to PTX + driver JIT. For Blackwell, this repo's torch/CUDA pins are the
-   wrong stack - see Docs/SETUP.md, 'GPUs newer than CUDA 12.1'."
+    if [[ "$(printf '%s\n%s\n' "$highest" "$MAX_NATIVE_CAP" | sort -V | tail -1)" != "$MAX_NATIVE_CAP" ]]; then
+      warn "Compute capability $highest is NEWER than CUDA ${CUDA_VERSION%.*} supports natively (max sm_${MAX_NATIVE_CAP/./}).
+   The build falls back to PTX + driver JIT. You likely need a newer torch/CUDA pin than this
+   repo currently carries - see Docs/SETUP.md, 'GPUs newer than the pinned CUDA'."
     fi
     ARCH_LIST="$(printf '%s;' "${caps[@]}" | sed 's/;$//')+PTX"
     info "TORCH_CUDA_ARCH_LIST=$ARCH_LIST"
@@ -208,7 +209,7 @@ fi
 if [[ -n "${LD_LIBRARY_PATH:-}" ]] && grep -qi cuda <<<"${LD_LIBRARY_PATH:-}"; then
   warn "LD_LIBRARY_PATH references a system CUDA:
    ${LD_LIBRARY_PATH}
-   Not changed by this script, but it can shadow the env's CUDA 12.1 libraries at runtime.
+   Not changed by this script, but it can shadow the env's CUDA 12.8 libraries at runtime.
    If torch reports an unexpected CUDA version, unset it for the training shell."
 fi
 
@@ -251,7 +252,7 @@ fi
 
 # The CUDA toolkit goes INSIDE the env, never system-wide:
 #  - pointnet2_ops_lib is a CUDAExtension compiled from source, so nvcc must match the CUDA torch
-#    was built against (12.1) or the extension is ABI-incompatible.
+#    was built against (12.8) or the extension is ABI-incompatible.
 #  - An env-local toolkit shadows the system nvcc only while the env is activated, so the machine's
 #    own CUDA install is untouched and other users are unaffected.
 # --system-cuda skips this and builds against whatever nvcc is on PATH instead.
@@ -259,7 +260,7 @@ if [[ $SYSTEM_CUDA -eq 1 ]]; then
   command -v nvcc >/dev/null 2>&1 || die "--system-cuda given but no nvcc on PATH."
   sys_cuda="$(nvcc --version | awk '/release/{gsub(",","",$5); print $5}')"
   info "using system nvcc $sys_cuda (--system-cuda; env-local toolkit skipped)"
-  [[ "${sys_cuda%%.*}" == "12" ]] || warn "System CUDA $sys_cuda is not 12.x; torch is built against 12.1.
+  [[ "${sys_cuda%%.*}" == "12" ]] || warn "System CUDA $sys_cuda is not 12.x; torch is built against 12.8.
    The extension may fail to build or be ABI-incompatible. Drop --system-cuda to use CUDA $CUDA_VERSION."
 elif [[ -x "$ENV_PREFIX/bin/nvcc" ]]; then
   info "env-local nvcc already present, skipping toolkit install"
@@ -307,16 +308,28 @@ def check(label, cond, detail=""):
     ok &= bool(cond)
     print(f"    [{'OK ' if cond else 'FAIL'}] {label}{(' - ' + detail) if detail else ''}")
 
-check("python 3.10", sys.version_info[:2] == (3, 10), sys.version.split()[0])
-check("torch 2.1.0+cu121", torch.__version__.startswith("2.1.0+cu121"), torch.__version__)
+check("python 3.11", sys.version_info[:2] == (3, 11), sys.version.split()[0])
+check("torch 2.8.0+cu128", torch.__version__.startswith("2.8.0+cu128"), torch.__version__)
 check("CUDA available", torch.cuda.is_available())
 if torch.cuda.is_available():
     check("GPU visible", True, torch.cuda.get_device_name(0))
+    # This is the check that actually catches an arch mismatch. cuBLAS ships precompiled SASS
+    # with no usable PTX fallback, so on a GPU the wheel was not built for, matmul raises
+    # "CUBLAS_STATUS_NOT_SUPPORTED" / "no kernel image is available" even though
+    # torch.cuda.is_available() returned True a line earlier.
     a = torch.randn(1024, 1024, device="cuda"); torch.cuda.synchronize()
-    check("GPU matmul", torch.isfinite(a @ a).all().item())
+    check("GPU matmul (cuBLAS arch match)", torch.isfinite(a @ a).all().item())
+    cap = "%d.%d" % torch.cuda.get_device_capability(0)
+    check("GPU arch in torch's build list", cap in torch.cuda.get_arch_list()
+          or f"sm_{cap.replace('.', '')}" in torch.cuda.get_arch_list(),
+          f"device sm_{cap.replace('.', '')}, wheel has {' '.join(torch.cuda.get_arch_list())}")
+    # Not asserted against a fixed number - just reported, because the --devices N indices baked
+    # into run_experiment_matrix_gpu*.sh assume this many devices at indices 0..N-1.
+    check("GPU count", torch.cuda.device_count() >= 1,
+          f"{torch.cuda.device_count()} visible")
 
 import numpy, numba, lightning              # noqa: E402
-check("numpy 1.24.4 (torch ABI)", numpy.__version__ == "1.24.4", numpy.__version__)
+check("numpy 1.26.4 (torch ABI)", numpy.__version__ == "1.26.4", numpy.__version__)
 check("numba importable", True, numba.__version__)
 check("lightning importable", True, lightning.__version__)
 

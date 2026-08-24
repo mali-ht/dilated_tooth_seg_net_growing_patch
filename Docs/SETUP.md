@@ -59,7 +59,7 @@ Other useful flags:
 | `--conda-root PATH` | Use a conda the auto-detection missed (it searches `$CONDA_EXE`, `$PATH`, `~/miniconda3`, `~/anaconda3`, `~/miniforge3`, `~/mambaforge`, `/opt/conda`, and more). |
 | `--env-prefix PATH` | Put the environment somewhere specific — e.g. a scratch volume rather than `$HOME`. |
 | `--env-name NAME` | Name the environment (default `dtsegnet`). |
-| `--system-cuda` | Build against the machine's existing `nvcc` instead of installing an env-local CUDA 12.1 (saves ~4 GB; see the caveat below). |
+| `--system-cuda` | Build against the machine's existing `nvcc` instead of installing an env-local CUDA 12.8 (saves ~4 GB; see the caveat below). |
 
 ### Where the environment is placed
 
@@ -73,8 +73,9 @@ modified.
 
 Probably not, even though the machine already has CUDA. The env-local toolkit exists because
 `pointnet2_ops_lib` is compiled from source and `nvcc` must match the CUDA that torch was built
-against (**12.1**). A server's system CUDA is rarely exactly 12.1, and a mismatch produces either
-a build failure or — worse — an extension that builds cleanly and then misbehaves at runtime.
+against (**12.8**). A server's system CUDA is rarely exactly 12.8 — the Blackwell box this was
+deployed to ships 13.2 — and a mismatch produces either a build failure or, worse, an extension
+that builds cleanly and then misbehaves at runtime.
 
 The env-local toolkit is not a system change: it is inside the environment directory and shadows
 the system `nvcc` **only while that environment is activated**. Other users and other projects see
@@ -91,31 +92,39 @@ if it is not.
 |---|---|---|---|
 | NVIDIA driver | *existing one reused* | system | Only installed with `--with-driver`; see [Open vs. proprietary](#open-vs-proprietary-kernel-modules) |
 | conda | *existing one reused* | wherever it already is | Only installed with `--install-conda`, and only if none was found |
-| Python | **3.10** | conda env `dtsegnet` | `torch 2.1.0` publishes **no wheels for Python 3.12**, the default on Ubuntu 24.04 |
-| CUDA toolkit | **12.1.1** | *inside* the conda env | Must match torch's `+cu121` to compile `pointnet2_ops_lib` |
-| gcc / g++ | **12** | *inside* the conda env | CUDA 12.1's `nvcc` **rejects gcc ≥ 13**, Ubuntu 24.04's default |
-| torch | `2.1.0+cu121` | pip | Pinned by `requirements.txt` |
-| numpy | `1.24.4` | pip | Torch 2.1's compiled ABI; a newer numpy breaks it |
-| numba | `0.58.1` | pip | Required by `models/patch_collate.py`; newest versions pull numpy past 1.24.4 |
-| setuptools | `<81` | pip | `lightning 2.1.0` needs `pkg_resources`, removed in setuptools 82 |
+| Python | **3.11** | conda env `dtsegnet` | Supported by every pin below; 3.13 (Ubuntu 24.04's `python3`) is ahead of numba's support window |
+| CUDA toolkit | **12.8.1** | *inside* the conda env | Must match torch's `+cu128` to compile `pointnet2_ops_lib` |
+| gcc / g++ | **13** | *inside* the conda env | CUDA 12.8's `nvcc` accepts gcc ≤ 14 |
+| torch | `2.8.0+cu128` | pip | Pinned by `requirements.txt`; first line with native **sm_120** SASS |
+| numpy | `1.26.4` | pip | Last 1.x. Code was written against 1.24; keeps numpy-2 breakage off the table |
+| numba | `0.61.2` | pip | Required by `models/patch_collate.py`; supports py3.11 and numpy 1.26 |
+| lightning | `2.5.6` | pip | Needs torch ≥ 2.1; no longer touches `pkg_resources` |
 | pointnet2_ops | built from source | pip, `--no-build-isolation` | Custom CUDA kernels; no wheel exists |
+
+> **Migrated 2026-08-22** from `torch 2.1.0+cu121` / CUDA 12.1 / Python 3.10 / numpy 1.24.4 /
+> numba 0.58.1. The trigger was deploying to 4× RTX PRO 6000 Blackwell (sm_120); see
+> [GPUs newer than the pinned CUDA](#gpus-newer-than-the-pinned-cuda). The same migration also
+> dropped 16 never-imported dependencies (torchvision/torchaudio/torchtext/torchdata, pandas,
+> seaborn, mlxtend, nltk, jupyterlab, ipywidgets, streamlit, scikit-learn, scikit-image,
+> opencv-python, Pillow, imgaug) — see the comment block in `requirements.txt`. The
+> `setuptools<81` pin is gone with them, since it only existed for `lightning 2.1.0`.
 
 ### Why the CUDA toolkit is installed *inside* the conda environment
 
 `pointnet2_ops_lib` is a `CUDAExtension` compiled from source, so `nvcc` must match the CUDA
-version torch was built against (12.1) or the resulting `.so` is ABI-incompatible with torch.
+version torch was built against (12.8) or the resulting `.so` is ABI-incompatible with torch.
 
-CUDA **12.1 specifically** is not obtainable from the usual system sources on Ubuntu 24.04:
+Matching that exactly from system sources is unreliable: whatever CUDA the box happens to ship is
+whatever the admins installed, and it is usually *newer* rather than equal. The Blackwell server
+this was deployed to has CUDA **13.2** system-wide, a full major version ahead of torch's 12.8 —
+which is precisely the case `--system-cuda` would get wrong.
 
-- Ubuntu's own `nvidia-cuda-toolkit` package is **12.0**
-- NVIDIA's official `ubuntu2404` apt repo **starts at 12.5** — 12.1 predates Ubuntu 24.04 support
-
-The `nvidia` conda channel does publish exactly `12.1.1`, so the toolkit goes in the environment.
+The `nvidia` conda channel publishes exactly `12.8.1`, so the toolkit goes in the environment.
 This is also strictly better for a shared server: no system-wide CUDA to conflict with other
 users' projects, no `sudo` needed, and multiple CUDA versions can coexist in different envs.
 
-The same reasoning applies to gcc-12: it is installed as a conda package
-(`gcc_linux-64=12` / `gxx_linux-64=12`) rather than system-wide. Conda's activation scripts set
+The same reasoning applies to gcc-13: it is installed as a conda package
+(`gcc_linux-64=13` / `gxx_linux-64=13`) rather than system-wide. Conda's activation scripts set
 `CC` and `CXX` automatically, so `torch.utils.cpp_extension` picks it up with no extra config.
 
 ---
@@ -182,19 +191,29 @@ torch.AcceleratorError: CUDA error: the launch timed out and was terminated
 A headless server does not have this problem, which is one good reason to train on one. Check
 with `nvidia-smi --query-gpu=display_active --format=csv` — you want `Disabled`.
 
-### GPUs newer than CUDA 12.1
+### GPUs newer than the pinned CUDA
 
-CUDA 12.1 emits native code for **sm_50 through sm_90** (up to Hopper / H100). Newer hardware —
-**Blackwell: RTX 50-series is sm_120, B200 is sm_100** — has no native support in this toolkit. It
-can only run through PTX JIT compilation at first launch, which is slow to start and not
-guaranteed to work.
+CUDA 12.8 emits native code for **sm_50 through sm_120**, which covers Blackwell (RTX 50-series
+and RTX PRO 6000 Blackwell are `sm_120`; B200 is `sm_100`). Anything *newer* than sm_120 would run
+only through PTX JIT compilation at first launch — slow to start and not guaranteed to work.
 
 `setup_server.sh` detects the compute capability, appends `+PTX` to `TORCH_CUDA_ARCH_LIST` for
-forward compatibility, and prints a loud warning if the GPU is newer than sm_90.
+forward compatibility, and warns loudly if the GPU is newer than `MAX_NATIVE_CAP` (12.0).
 
-**If you are deploying to Blackwell hardware, this repo's pins are the wrong stack.** You need
-torch ≥ 2.7 with CUDA ≥ 12.8, which in turn means re-pinning numpy, numba and lightning together.
-That is a genuine migration, not a version bump — budget time for it.
+**What this failure actually looks like**, if you ever run a too-old CUDA pin on newer hardware:
+the install succeeds, `import torch` succeeds, and `torch.cuda.is_available()` returns `True`.
+It breaks at the first real kernel launch, because cuBLAS/cuDNN ship precompiled SASS with no
+usable PTX fallback — so you get `CUBLAS_STATUS_NOT_SUPPORTED` or `no kernel image is available
+for execution on the device` from an innocuous-looking matmul. That is why Phase 7 of
+`setup_server.sh` runs an actual matmul and cross-checks `torch.cuda.get_arch_list()` against the
+device capability, rather than trusting `is_available()`.
+
+This bit the project for real on 2026-08-22: the cu121 pins were carried onto a 4× RTX PRO 6000
+Blackwell server and had to be migrated to `torch 2.8.0+cu128` before anything could train. If you
+hit the same wall on future hardware, the four things that must move together are
+`requirements.txt`'s torch/numpy/numba pins and `setup_server.sh`'s `PY_VERSION`, `CUDA_VERSION`,
+`GCC_VERSION`, `MIN_DRIVER` and `MAX_NATIVE_CAP` constants — plus the Phase 7 assertions, which
+hard-code the expected versions.
 
 ---
 
@@ -236,13 +255,23 @@ Every error below was hit for real while building this environment.
 
 **`ModuleNotFoundError: No module named 'numba'`**
 `models/patch_collate.py` imports numba at module level. It was missing from `requirements.txt`
-until 2026-08-20 — update your checkout, or `pip install numba==0.58.1`. Do **not** install an
-unpinned numba: it will pull numpy past 1.24.4 and break torch's ABI.
+until 2026-08-20 — update your checkout, or `pip install numba==0.61.2`. Do **not** install an
+unpinned numba: current releases resolve numpy past the pinned 1.26.4.
 
 **`ModuleNotFoundError: No module named 'pkg_resources'` on `import lightning`**
-setuptools ≥ 82 removed `pkg_resources`, which `lightning 2.1.0` still calls. Fix:
-`pip install "setuptools<81"`. The deprecation *warning* this then prints on every run is expected
-and harmless.
+Only affects the pre-2026-08-22 stack, where `lightning 2.1.0` called
+`pkg_resources.declare_namespace()` at import and setuptools ≥ 82 had removed it. `lightning
+2.5.6` does not, and the `setuptools<81` pin has been dropped. If you still see this, you are on
+an old environment — rebuild it.
+
+**`ModuleNotFoundError: No module named 'dataset.patch_dataset'`**
+The `dataset/` package is missing from your working tree, not from the repo. This happened on the
+Blackwell server on 2026-08-22 — an incomplete transfer left all 17 `dataset/*.py` files and
+`train_patch_network_color.py` (the entry point every `run_experiment_matrix_gpu*.sh` calls)
+deleted locally while still tracked in git. Check with `git status` and fix with:
+```bash
+git restore dataset/ train_patch_network_color.py
+```
 
 **`ModuleNotFoundError: No module named 'torch'` while building pointnet2_ops**
 PEP 517 builds in an isolated environment, but `pointnet2_ops_lib/setup.py` imports torch at module
@@ -251,8 +280,8 @@ level. Build with isolation disabled:
 pip install --no-build-isolation ./pointnet2_ops_lib
 ```
 
-**`unsupported GNU version! gcc versions later than 12 are not supported`**
-System gcc-13 is being used instead of the env's gcc-12. Confirm `echo $CC` points into the conda
+**`unsupported GNU version! gcc versions later than 14 are not supported`**
+A too-new system gcc is being used instead of the env's gcc-13. Confirm `echo $CC` points into the conda
 env; if empty, re-activate the environment (`conda deactivate && conda activate dtsegnet`).
 
 **`nvidia-smi: command not found` after installing the driver**
@@ -260,8 +289,8 @@ You have not rebooted, or the DKMS build failed, or Secure Boot is blocking the 
 that order: `uptime`, `sudo dkms status`, `mokutil --sb-state`.
 
 **`torch.cuda.is_available()` is False, but `nvidia-smi` works fine**
-Most often the machine's driver is too old for the CUDA 12.1 runtime. torch 2.1.0+cu121 needs
-driver **>= 525.60.13**; newer is always fine, older cannot initialise CUDA at all. Check with
+Most often the machine's driver is too old for the CUDA 12.8 runtime. torch 2.8.0+cu128 needs
+driver **>= 570.26** (the floor for sm_120 support at all); newer is always fine, older cannot initialise CUDA at all. Check with
 `nvidia-smi --query-gpu=driver_version --format=csv,noheader` — `setup_server.sh` warns about this
 during Phase 1. Updating a driver is a system change, so on a server you do not administer this is
 a conversation with whoever does, not something to force. The other common cause is that the
@@ -269,7 +298,7 @@ process cannot see the GPU at all (container without `--gpus all`, or `CUDA_VISI
 to an empty or wrong value).
 
 **torch reports an unexpected CUDA version, or CUDA libraries fail to load**
-A system-wide `LD_LIBRARY_PATH` pointing at another CUDA can shadow the environment's own 12.1
+A system-wide `LD_LIBRARY_PATH` pointing at another CUDA can shadow the environment's own 12.8
 libraries. `setup_server.sh` warns when it sees this but deliberately does not change it — it is
 usually set by a site-wide profile or an environment module. Unset it for the training shell:
 ```bash
@@ -291,8 +320,12 @@ a clean `pip check` because of it.
 ## The Docker path
 
 The repo's [Dockerfile](../Dockerfile) is an alternative to `setup_server.sh` and skips the conda
-layer entirely — it starts `FROM nvidia/cuda:12.1.0-devel-ubuntu20.04`, so Python 3.10, CUDA 12.1
-and a compatible gcc all come from the base image. The **host still needs an NVIDIA driver** (and
+layer entirely — it starts `FROM nvidia/cuda:12.8.1-devel-ubuntu22.04`, so Python 3.11, CUDA 12.8
+and a compatible gcc all come from the base image. (That base image was bumped from
+`12.1.0-devel-ubuntu20.04` on 2026-08-22 with the rest of the Blackwell migration: it consumes the
+same `requirements.txt`, so a stale cu121 base under a cu128 torch would fail at the first kernel
+launch. It also installs `jupyterlab` itself now, since the dependency prune removed it from
+`requirements.txt` and this image's default `CMD` is `jupyter lab`.) The **host still needs an NVIDIA driver** (and
 the NVIDIA Container Toolkit, for `--gpus all`); only the toolkit and userspace move into the
 image. Phase 1 of `setup_server.sh` is therefore still relevant on a Docker host — the rest is not.
 

@@ -24,7 +24,19 @@ echo "[gpu1 1/3] TRANSFORMER (early + late global): --architecture dilated_trans
 # local+dilated representation - see models/patch_dilated_tooth_seg_transformer_deep_network.py's
 # own module docstring for the full design) beats the dilated-blocks-only baseline. This is the
 # "most global understanding" variant - both injection points active at once, not just one.
-CMD1="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --architecture dilated_transformer --add_late_global --epochs 200 --devices 1 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv_transformer_lateglobal"
+# --------------------------------------------------------------------------------------------
+# --num_workers 20 (added 2026-08-22, server deployment): the script's own default of 8 was tuned
+# on the 24-core dev machine, alongside the NUMBA_NUM_THREADS=1 fix documented at the top of
+# train_patch_network_color.py ("concurrency should come from num_workers"). This server has 128
+# cores. Measured on the first launch attempt with the default 8: 4 lanes x 8 train workers = 32
+# active worker processes, GPUs averaging 4-17% utilisation, 58% of CPU idle and %wa = 0.0 (so
+# starved by the collate pipeline, not by disk). 20 per lane puts 80 of 128 cores to work while
+# leaving headroom for the 4 main processes and for each lane's persistent val worker pool waking
+# up during validation. Raise further only with the same measurement in hand - the header comment
+# in train_patch_network_color.py documents what over-subscription looked like when it went wrong.
+# --------------------------------------------------------------------------------------------
+
+CMD1="python3 train_patch_network_color.py --num_workers 20 --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --architecture dilated_transformer --add_late_global --epochs 200 --devices 1 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv_transformer_lateglobal"
 script -qec "$CMD1" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_color_mosaic_tuned_hsv_transformer_lateglobal.log
 
 echo "[gpu1 2/3] WHOLE-TOOTH CURRICULUM ON: whole_tooth_patch_prob=0.3, everything else = anchor"
@@ -33,7 +45,7 @@ echo "[gpu1 2/3] WHOLE-TOOTH CURRICULUM ON: whole_tooth_patch_prob=0.3, everythi
 # real ceiling (the anchor's own 200-epoch extension kept climbing well past epoch 100). Both the
 # anchor [gpu3] and this run now get the full 200-epoch budget, so whichever wins does so at a
 # comparable point in each config's own trajectory.
-CMD2="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.3 --epochs 200 --devices 1 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv_wholetooth"
+CMD2="python3 train_patch_network_color.py --num_workers 20 --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 20 90 180 --early_bias_power 1.5 --whole_tooth_patch_prob 0.3 --epochs 200 --devices 1 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_tuned_hsv_wholetooth"
 script -qec "$CMD2" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_color_mosaic_tuned_hsv_wholetooth.log
 
 echo "[gpu1 3/3] AREA_THRESHOLDS AT DEFAULT: 40/180/360 (was 20/90/180 tuned), early_bias_power STAYS TUNED (1.5)"
@@ -43,7 +55,7 @@ echo "[gpu1 3/3] AREA_THRESHOLDS AT DEFAULT: 40/180/360 (was 20/90/180 tuned), e
 # the anchor, early_bias_power was doing most of the lifting; if it drops close to the old
 # untuned baseline (0.6505), area_thresholds tuning was the real driver. See
 # run_experiment_matrix_gpu2.sh's early_bias_power-default run for the complementary isolation.
-CMD3="python3 train_patch_network_color.py --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 40 180 360 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --epochs 200 --devices 1 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_earlyBiasTunedOnly"
+CMD3="python3 train_patch_network_color.py --num_workers 20 --num_classes 17 --dilation_gating on --color_style mosaic --area_thresholds 40 180 360 --early_bias_power 1.5 --whole_tooth_patch_prob 0.0 --epochs 200 --devices 1 --experiment_version Patch_Seg_17class_gateOn_color_mosaic_earlyBiasTunedOnly"
 script -qec "$CMD3" /dev/null 2>&1 | tee logs/experiments/17class_gateOn_color_mosaic_earlyBiasTunedOnly.log
 
 echo "[gpu1] lane complete. Checkpoints under $CKPT_ROOT/<experiment_version>/, logs under logs/experiments/."

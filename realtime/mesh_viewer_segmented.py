@@ -32,6 +32,7 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import numpy as np
@@ -50,12 +51,15 @@ from dataset.patch_preprocessing import PatchPreTransform  # noqa: E402
 from dataset.patch_preprocessing_real_color import PatchPreTransformWithRealColor  # noqa: E402
 from models.patch_collate import PatchCollator, precompute_neighbor_indices  # noqa: E402
 from models.patch_lightning_module import PatchLitDilatedToothSegmentationNetwork  # noqa: E402
+from models.patch_lightning_module_transformer import PatchLitDilatedToothSegTransformerNetwork  # noqa: E402
+from models.patch_lightning_module_transformer_deep import PatchLitDilatedToothSegTransformerDeepNetwork  # noqa: E402
 from dataset.patch_color_augmentation import GUM_RGB_HIGH, GUM_RGB_LOW, TOOTH_RGB_HIGH, TOOTH_RGB_LOW  # noqa: E402
 # live_preprocessing.py is a sibling in this same realtime/ directory - bare import, same
 # convention as mesh_wire/debug_log/mesh_viewer_linux above, resolves whether this file is run
 # directly (its own dir is auto-added to sys.path) or imported as realtime.mesh_viewer_segmented
 # (replay_guidance.py/test_live_segmenter.py both explicitly add realtime/ to sys.path themselves).
 from live_color_smoothing import TemporalGumClassifier  # noqa: E402
+from guidance_waypoints import ForwardSweepProgress  # noqa: E402
 from live_preprocessing import (NO_COLOR_SENTINEL, cap_face_count, claim_new_voxels,  # noqa: E402
                                  decimate_chunk_worker, downsample_to_density, merge_meshes,
                                  mesh_to_model_inputs, mesh_to_model_inputs_with_color,
@@ -113,6 +117,33 @@ def update_guidance_confirmation(counts, streaks: dict, confirmed: set, min_face
                 confirmed.add(label)
         else:
             streaks[label] = 0
+
+
+def load_lit_model(ckpt_path, device):
+    """Auto-detects which of the 3 patch-network LightningModule classes a checkpoint belongs to
+    by inspecting its own saved state_dict keys, rather than requiring the caller to remember and
+    correctly pass matching --architecture/--add_late_global flags at inference time (real risk on
+    a live-hardware session: loading a transformer checkpoint's weights into the wrong class's
+    strict load_state_dict doesn't silently misbehave, it raises a missing/unexpected-keys error -
+    but better to never hit that at all). Distinguishing keys:
+      - 'model.late_global_transformer_block.*' present -> PatchDilatedToothSegTransformerDeepNetwork
+        (early+late global, models/patch_dilated_tooth_seg_transformer_deep_network.py)
+      - 'model.global_transformer_block.*' present (without the above) ->
+        PatchDilatedToothSegTransformerNetwork (early-global only,
+        models/patch_dilated_tooth_seg_transformer_network.py)
+      - neither -> PatchDilatedToothSegmentationNetwork (original, no transformer)
+    All three LightningModules share the same public interface (.model, .hparams, predict_labels,
+    same forward signature) that LiveSegmenter relies on, so which one gets returned here is
+    otherwise transparent to every caller."""
+    keys = torch.load(ckpt_path, map_location='cpu', weights_only=False)['state_dict'].keys()
+    if any(k.startswith('model.late_global_transformer_block.') for k in keys):
+        cls, tag = PatchLitDilatedToothSegTransformerDeepNetwork, 'transformer (early+late global)'
+    elif any(k.startswith('model.global_transformer_block.') for k in keys):
+        cls, tag = PatchLitDilatedToothSegTransformerNetwork, 'transformer (early-global only)'
+    else:
+        cls, tag = PatchLitDilatedToothSegmentationNetwork, 'dilated (no transformer)'
+    print(f"[*] checkpoint architecture auto-detected: {tag}")
+    return cls.load_from_checkpoint(ckpt_path, map_location=device)
 
 
 def _debug(msg):
@@ -211,7 +242,9 @@ class LiveSegmenter:
 
     def __init__(self, model, device, num_classes=17, target_density=5.0, arch=None, max_model_faces=20000,
                  pool_workers=6, snapshot_dir=None, snapshot_every=1, color_mode='varying',
-                 guidance_confirm_cycles=8, gum_smoothing_alpha=None):
+                 guidance_confirm_cycles=8, gum_smoothing_alpha=None,
+                 guidance_return_waypoint_mm=8.0, guidance_forward_waypoint_mm=8.0,
+                 guidance_forward_min_progress_mm=4.0):
         self.model = model
         self.device = device
         self.num_classes = num_classes
@@ -307,6 +340,7 @@ class LiveSegmenter:
         self._last_chunk_centroid = None  # updated in _fold_new_chunks - "where is the scanner
                                            # right now" proxy, since the wire protocol carries no
                                            # actual pose data
+        self._recent_chunk_centroids = deque(maxlen=5)
         self._guidance_projection = None  # fixed (3,2) PCA projection, fit once and reused for
                                            # the whole scan so the arrow's frame doesn't drift
         self.guidance_min_faces = 30  # a label needs at least this many predicted faces to count
@@ -316,6 +350,30 @@ class LiveSegmenter:
         # the right one - prevents a large, disorienting jump straight to whatever the right
         # sweep already silently progressed to while the scanner was still physically on the left.
         self.guidance_center_return_threshold_mm = 20.0
+        # 2026-08-24 (user-requested): a SEPARATE, tighter threshold for the return-sweep's own
+        # per-tooth waypoints (see _compute_guidance) - real teeth are only ~8-10mm apart, so
+        # reusing the 20mm value above let 2-3 adjacent waypoints get marked reached from a single
+        # scanner position (verified directly: a synthetic 9mm-spaced arch marked teeth 1/2/3 all
+        # reached from one position at tooth 1). This one stays close to real tooth spacing so the
+        # sweep is genuinely one-tooth-at-a-time.
+        self.guidance_return_waypoint_mm = guidance_return_waypoint_mm
+        # Confirmation means the model can SEE a tooth; it does not prove that
+        # the scanner has physically arrived there.  Keep separate outbound
+        # progress state for each side.  This prevents broad accumulated context
+        # from skipping #5 and immediately steering toward #4 while the probe is
+        # still approaching #5 (2026-08-30 live run).
+        self.guidance_forward_waypoint_mm = guidance_forward_waypoint_mm
+        self.guidance_forward_min_progress_mm = guidance_forward_min_progress_mm
+        if self.guidance_forward_waypoint_mm <= 0:
+            raise ValueError("guidance_forward_waypoint_mm must be positive")
+        if self.guidance_forward_min_progress_mm < 0:
+            raise ValueError("guidance_forward_min_progress_mm must be >= 0")
+        self._guidance_left_progress = ForwardSweepProgress(
+            _GUIDANCE_LEFT_SEQUENCE, guidance_forward_waypoint_mm,
+            guidance_forward_min_progress_mm)
+        self._guidance_right_progress = ForwardSweepProgress(
+            _GUIDANCE_RIGHT_SEQUENCE, guidance_forward_waypoint_mm,
+            guidance_forward_min_progress_mm)
 
         # Finding #13 (REALTIME.md): _compute_guidance used to rebuild its "confidently identified"
         # set fresh from ONLY the current cycle's prediction counts - no memory across cycles. Real
@@ -338,6 +396,16 @@ class LiveSegmenter:
         self._guidance_confirmed = set()  # label -> permanently confirmed once the streak requirement is met
         self._guidance_confirmed_pos = {}  # label -> last known centroid while confirmed (kept fresh
                                             # when the label has enough faces THIS cycle, else reused)
+        # 2026-08-24 (user-requested): which LEFT_SEQUENCE waypoints the scanner has already
+        # passed back through on the return sweep from tooth 1 to tooth 8 - see _compute_guidance's
+        # own docstring. Sticky like _guidance_confirmed (a later dip away from a waypoint doesn't
+        # un-reach it).
+        self._guidance_return_reached = set()
+        # Whether the return sweep has ever engaged yet - gates the one-time "resume from where the
+        # scanner actually is" seed in _compute_guidance (Finding #15, REALTIME.md). Separate from
+        # _guidance_return_reached being non-empty, since that set is legitimately still empty on
+        # the first engaged cycle if no waypoint has a centroid yet.
+        self._guidance_return_started = False
         _debug(f"LiveSegmenter init: guidance_confirm_cycles={self.guidance_confirm_cycles}")
 
         # Prediction-debugging methodology (per the live investigation request): every
@@ -392,6 +460,27 @@ class LiveSegmenter:
             self._raw_faces_seen[mesh_id] = n
             self._raw_faces_total += (n - prev)
         _debug(f"update_chunk: mesh_id={mesh_id} vertices={len(vertices)} triangles={n}")
+
+    def reset_session(self):
+        """Discard all geometry expressed in the previous scanner model frame."""
+        with self._lock:
+            self.chunks.clear()
+            self._raw_faces_seen.clear()
+            self._raw_faces_total = 0
+            self._decimated_faces_total = 0
+            self._raw_area_total_mm2 = 0.0
+            self._folded_signature.clear()
+            self._accumulated = None
+            self._claimed_voxels.clear()
+            self._last_chunk_centroid = None
+            self._recent_chunk_centroids.clear()
+            self._guidance_projection = None
+            self._guidance_streaks.clear()
+            self._guidance_confirmed.clear()
+            self._guidance_confirmed_pos.clear()
+            self._guidance_return_reached.clear()
+            self._guidance_return_started = False
+        _debug("LiveSegmenter reset_session: cleared prior scanner coordinate frame")
 
     def _fold_new_chunks(self, chunks_snapshot):
         """Decimates + voxel-dedups any mesh_id that's new or changed since it was last folded
@@ -521,7 +610,14 @@ class LiveSegmenter:
             # - the highest one folded this cycle is the freshest real-world position data
             # available, used as a "where is the scanner right now" proxy for motion guidance
             # (_compute_guidance) since the wire protocol carries no actual scanner pose.
-            self._last_chunk_centroid = raw_centroids[max(to_evict)]
+            # Match Auto_scan's live patch-centroid origin: one small chunk can
+            # jump across a tooth even while the tool barely moves, so physical
+            # waypoint progression uses a short temporal mean rather than the
+            # noisiest single newest patch.
+            for mesh_id in sorted(to_evict):
+                self._recent_chunk_centroids.append(raw_centroids[mesh_id])
+            self._last_chunk_centroid = np.mean(
+                np.asarray(self._recent_chunk_centroids), axis=0)
             with self._lock:
                 for mesh_id in to_evict:
                     self.chunks.pop(mesh_id, None)
@@ -687,6 +783,10 @@ class LiveSegmenter:
             "t_dedup_chunks": t_dedup_chunks, "t_merge": t_merge, "t_cap": t_cap, "t_feature": t_feature,
             "t_collate": t_collate, "collate_timings": collate_timings, "t_infer": t_infer,
             "model_timings": model_timings, "t_total": t_total, "guidance": guidance,
+            # Auto_scan associates the newest raw patch with these per-face
+            # semantic predictions. Kept in-memory only; its session logger
+            # writes the derived compact localization state, not this array.
+            "pred_labels": pred_labels,
         }
         return down, colors, label_positions, stats
 
@@ -749,6 +849,9 @@ class LiveSegmenter:
                 # future investigation can directly see which labels were confirmed and when,
                 # rather than needing to reverse-engineer it from pred_labels + replay_guidance.py.
                 guidance_confirmed_labels=np.array(sorted(self._guidance_confirmed), dtype=np.int32),
+                # 2026-08-24 return-sweep waypoints (1->8, LEFT_SEQUENCE reversed) already reached
+                # at THIS cycle - see _compute_guidance's own docstring.
+                guidance_return_reached=np.array(sorted(self._guidance_return_reached), dtype=np.int32),
                 has_face_colors=np.bool_(face_colors is not None),
                 face_colors=(face_colors.astype(np.uint8) if face_colors is not None
                              else np.zeros((0, 3), dtype=np.uint8)),
@@ -756,13 +859,29 @@ class LiveSegmenter:
         except Exception as e:  # noqa: BLE001
             _debug(f"_save_snapshot: failed to write {path}: {e}")
 
+    def _mark_return_reached(self, return_seq, label):
+        """Marks `label` AND every earlier return-sweep waypoint as reached (Finding #15,
+        REALTIME.md) - return-sweep progress is monotone along return_seq, so getting to waypoint k
+        means everything before k is behind the scanner whether or not it was ever individually
+        marked. Without this implication a single missed waypoint stalls the target on it forever,
+        which is exactly what happened live: the target can only ever be the FIRST unreached
+        waypoint, so one gap makes every later one unreachable too. Two real ways a gap opens up:
+        the confirm-cycle lag (a waypoint whose label wasn't confirmed yet while the scanner was
+        physically there - it has no centroid to test against at that moment), and plain sampling
+        gaps (at 0.5-0.9s per cycle the scanner can move well past a waypoint's
+        guidance_return_waypoint_mm ball between two consecutive position samples)."""
+        self._guidance_return_reached.update(return_seq[:return_seq.index(label) + 1])
+
     def _compute_guidance(self, down, pred_labels):
         """Motion-guidance for the fixed scanning regimen (see _GUIDANCE_LEFT_SEQUENCE/
         _GUIDANCE_RIGHT_SEQUENCE above): given the CURRENT set of confidently-identified labels
         (>= self.guidance_min_faces predicted faces), the next target tooth is fully
         deterministic - no coverage-gap or PCA-based frontier heuristics needed, unlike a
         free-form scanning pattern would require (only 17-class label semantics apply here; the
-        regimen is meaningless for the 5-class coarse scheme).
+        regimen is meaningless for the 5-class coarse scheme). Confirmation and completion are
+        intentionally distinct: an outbound tooth advances only after it is confirmed AND the
+        recent scanner position is near/past its waypoint, with real movement required between
+        adjacent teeth. Accumulated context can reveal a label before the probe visits it.
 
         The target's real-world position isn't known until it's actually scanned, so it's
         estimated by extrapolating from the 1-2 nearest ALREADY-identified teeth in the same
@@ -788,11 +907,35 @@ class LiveSegmenter:
         straight to whatever the right sweep had already silently progressed to (one real case:
         8mm away -> 47.7mm away, opposite side of the arch, no transition) - not just a big
         jump, but skipping the "return to center" step the user's actual regimen includes as a
-        real physical movement. Now: once every left-sweep tooth is confidently identified, the
-        transition to the right sweep only happens once self._last_chunk_centroid is actually
-        back within guidance_center_return_threshold_mm of the 8/9 midline position - until then,
-        target stays label 9 (the right sweep's own start / the regimen's literal "come back to
-        8/9" instruction), pointing at its already-known position rather than extrapolating."""
+        real physical movement.
+
+        2026-08-24 (user-requested): the "return to center" step above is now a full RETURN SWEEP,
+        not a single jump straight to the 8/9 midline. Once every left-sweep tooth is confirmed,
+        the target walks BACKWARD through _GUIDANCE_LEFT_SEQUENCE in reverse
+        (1->2->3->4->5->6->7->8), re-visiting each already-confirmed tooth's own REAL (not
+        extrapolated) centroid in turn - deliberately re-sweeping the occlusal surface a second
+        time on the way back, rather than cutting straight across the arch. A waypoint counts as
+        reached once self._last_chunk_centroid comes within guidance_return_waypoint_mm of that
+        tooth's centroid - a SEPARATE, tighter threshold than guidance_center_return_threshold_mm
+        (real teeth are only ~8-10mm apart; reusing the 20mm value let 2-3 waypoints get marked
+        reached from a single position, verified directly against a synthetic arch before this was
+        split out). self._guidance_return_reached tracks this, sticky like _guidance_confirmed (a
+        later dip away doesn't un-reach one). Only once tooth 8 itself is reached does the target
+        switch to _GUIDANCE_RIGHT_SEQUENCE (starting at 9) - reaching 8 already puts the scanner at
+        the midline, so this subsumes the old single-point check rather than adding to it. The
+        right sweep's own first target then bridges across the midline using the left sweep's last
+        two known positions (see the target_pos extrapolation block below) rather than returning
+        None until it's freshly confirmed by real predictions - also verified directly: the
+        unbridged version returned None for the whole remainder of a test run once the return
+        sweep completed.
+
+        Finding #15 fix (REALTIME.md): the return sweep above always STARTED at tooth 1 and
+        required every waypoint to be individually marked reached, which stalled it permanently on
+        real hardware (2026-08-25 run, cycles 49-51: target pinned on tooth 1 at 30mm and growing,
+        pointing backwards, right sweep never reachable). Two changes, both here: a one-time seed
+        that starts the return from whichever waypoint the scanner is actually nearest when the
+        sweep first engages, and _mark_return_reached making waypoint progress monotone (reaching
+        waypoint k implies every earlier one). See those two call sites for the full reasoning."""
         if self.num_classes != 17 or self._last_chunk_centroid is None:
             return None
 
@@ -812,33 +955,95 @@ class LiveSegmenter:
             if label in self._guidance_confirmed_pos:
                 centroids[label] = self._guidance_confirmed_pos[label]
 
-        def first_missing(seq):
-            for lbl in seq:
-                if lbl not in centroids:
-                    return lbl
-            return None
-
         seq = _GUIDANCE_LEFT_SEQUENCE
-        target = first_missing(seq)
-        target_pos = None
+        phase = "left_outbound"
+        target = self._guidance_left_progress.update(
+            self._guidance_confirmed, centroids, self._last_chunk_centroid)
+        # A confirmed-but-not-yet-reached tooth is a real waypoint, not an
+        # extrapolation.  Before confirmation, retain the old extrapolation so
+        # the controller still has a direction in sparse early geometry.
+        target_pos = centroids.get(target)
 
         if target is None:
-            center_anchors = [centroids[lbl] for lbl in (8, 9) if lbl in centroids]
-            center_pos = np.mean(center_anchors, axis=0) if center_anchors else None
-            if (center_pos is not None
-                    and np.linalg.norm(self._last_chunk_centroid - center_pos)
-                    > self.guidance_center_return_threshold_mm):
-                target, target_pos = 9, center_pos
+            # Return sweep (see docstring): walk 1->2->...->8 (LEFT_SEQUENCE reversed), marking
+            # each waypoint reached once the scanner's own recent position gets within
+            # guidance_return_waypoint_mm of that tooth's REAL centroid. Checks every
+            # not-yet-reached waypoint each cycle (not just the current target) so a continuous
+            # sweep motion naturally marks each one off as the scanner passes it - the RETURNED
+            # target still always walks in strict order via the `next(...)` below regardless.
+            return_seq = tuple(reversed(_GUIDANCE_LEFT_SEQUENCE))
+            known = [lbl for lbl in return_seq if lbl in centroids]
+
+            # Finding #15 (REALTIME.md) - one-time seed, the moment the return sweep first engages:
+            # start from the waypoint the scanner is ACTUALLY nearest to, not unconditionally from
+            # tooth 1. guidance_confirm_cycles (8) means the left sweep isn't declared complete
+            # until ~8 cycles AFTER the scanner physically finished it, and the scanner keeps
+            # moving during that lag - so by the time this block first runs, it has typically
+            # already travelled some way back along the return path. Seeding from tooth 1 regardless
+            # made every waypoint it had already passed permanently unreachable (they're only ever
+            # checked from this block, which didn't exist yet while the scanner was there), pinning
+            # the target on tooth 1 behind the scanner for the rest of the run. No distance
+            # threshold here deliberately: the scanner is wherever it is, and pointing it back to
+            # tooth 1 is never the right answer regardless of how far from a waypoint it sits.
+            if not self._guidance_return_started and known:
+                self._guidance_return_started = True
+                nearest = min(known, key=lambda lbl: np.linalg.norm(
+                    self._last_chunk_centroid - centroids[lbl]))
+                self._mark_return_reached(return_seq, nearest)
+                _debug(f"_compute_guidance: return sweep engaged - seeding from waypoint {nearest} "
+                       f"(nearest to the scanner's current position), reached="
+                       f"{sorted(self._guidance_return_reached)}")
+
+            for lbl in return_seq:
+                if lbl in self._guidance_return_reached or lbl not in centroids:
+                    continue
+                if (np.linalg.norm(self._last_chunk_centroid - centroids[lbl])
+                        <= self.guidance_return_waypoint_mm):
+                    self._mark_return_reached(return_seq, lbl)
+
+            return_target = next((lbl for lbl in return_seq if lbl not in self._guidance_return_reached), None)
+            if return_target is not None:
+                phase = "left_return"
+                # A waypoint may have been confirmed earlier but be absent from
+                # the current capped mesh (the exact KeyError 1/7 seen in the
+                # 2026-09-02 hardware log). Missing live geometry is a normal
+                # navigation condition, not an inference failure. Leave the
+                # target unresolved here so the extrapolation block below can
+                # provide its documented fallback.
+                target, target_pos = return_target, centroids.get(return_target)
             else:
                 seq = _GUIDANCE_RIGHT_SEQUENCE
-                target = first_missing(seq)
+                phase = "right_outbound"
+                target = self._guidance_right_progress.update(
+                    self._guidance_confirmed, centroids,
+                    self._last_chunk_centroid)
+                target_pos = centroids.get(target)
 
+        progress = {
+            "confirmed_labels": sorted(int(x) for x in self._guidance_confirmed),
+            "left_outbound_reached": sorted(
+                int(x) for x in self._guidance_left_progress.reached),
+            "left_return_reached": sorted(
+                int(x) for x in self._guidance_return_reached),
+            "right_outbound_reached": sorted(
+                int(x) for x in self._guidance_right_progress.reached),
+        }
         if target is None:
-            return {"done": True}
+            return {"done": True, **progress}
 
         if target_pos is None:
             idx = seq.index(target)
             anchors = [lbl for lbl in seq[:idx] if lbl in centroids]
+            if not anchors and seq is _GUIDANCE_RIGHT_SEQUENCE:
+                # 2026-08-24 (user-requested): the right sweep's own first target has nothing
+                # BEFORE it within _GUIDANCE_RIGHT_SEQUENCE to extrapolate from - pre-existing gap
+                # (predates the return-sweep change above) where this fell through to `return
+                # None` below, making the arrow disappear for however many cycles it took the new
+                # target to get freshly confirmed by real predictions. Bridge across the midline
+                # instead: borrow the LEFT sweep's own last two known positions (7, then 8 - the
+                # ones closest to the midline) and extrapolate one more step in the same
+                # left-to-right direction, same formula as the normal case below.
+                anchors = [lbl for lbl in reversed(_GUIDANCE_LEFT_SEQUENCE[:2]) if lbl in centroids]
             if len(anchors) >= 2:
                 p_prev, p_last = centroids[anchors[-2]], centroids[anchors[-1]]
                 target_pos = p_last + (p_last - p_prev)
@@ -863,8 +1068,9 @@ class LiveSegmenter:
 
         return {"done": False, "target_label": int(target), "target_universal": universal,
                 "distance_mm": distance_mm, "compass": compass, "angle_deg": angle_deg,
+                "sweep_phase": phase,
                 "current_pos": np.array(self._last_chunk_centroid, dtype=np.float64),
-                "target_pos": np.array(target_pos, dtype=np.float64)}
+                "target_pos": np.array(target_pos, dtype=np.float64), **progress}
 
     def _label_positions(self, down, pred_labels):
         """For each non-gum class actually predicted this cycle, the centroid of its faces and
@@ -1152,8 +1358,19 @@ class SegmentedViewerApp:
         else:
             target_text = f"#{guidance['target_universal']}" if guidance["target_universal"] else \
                 f"label {guidance['target_label']}"
-            self.guidance_label.text = (f"guidance: {guidance['compass']}  move toward tooth "
-                                         f"{target_text}  (~{guidance['distance_mm']:.0f}mm)")
+            if guidance.get("navigation_mode") == "semantic_frontier":
+                current = guidance.get("current_tooth")
+                current_text = "unknown" if current is None else f"#{current}"
+                source = guidance.get("target_source", "semantic target").replace("_", " ")
+                evidence = guidance.get("target_evidence_points", 0)
+                hold = guidance.get("hold_reason")
+                self.guidance_label.text = (
+                    f"semantic: current {current_text}  ->  target {target_text}  "
+                    f"({source}, {guidance['distance_mm']:.1f}mm, evidence {evidence})"
+                    + (f"\nHOLD: {hold}" if hold else ""))
+            else:
+                self.guidance_label.text = (f"guidance: {guidance['compass']}  move toward tooth "
+                                             f"{target_text}  (~{guidance['distance_mm']:.0f}mm)")
             # Float the arrow above the occlusal surface rather than drawing it AT surface level -
             # direct feedback after a real run: it often ended up embedded in/under the mesh,
             # hard to see. Offsets both endpoints along the mesh's own average face normal (not a
@@ -1165,7 +1382,11 @@ class SegmentedViewerApp:
                 norm = np.linalg.norm(avg_normal)
                 if norm > 1e-6:
                     lift = avg_normal / norm * 4.0
-            arrow = guidance_arrow_mesh(guidance["current_pos"] + lift, guidance["target_pos"] + lift)
+            arrow_color = ((0.95, 0.65, 0.05) if guidance.get("motion_hold")
+                           else (0.9, 0.1, 0.1))
+            arrow = guidance_arrow_mesh(guidance["current_pos"] + lift,
+                                        guidance["target_pos"] + lift,
+                                        color=arrow_color)
             if arrow is not None:
                 try:
                     if raw_scene.has_geometry("guidance_arrow"):
@@ -1259,6 +1480,21 @@ def main():
                           "(8) was empirically chosen via replay_guidance.py against real "
                           "hardware snapshots - lower it for a more responsive but noisier arrow, "
                           "raise it for a slower but more conservative one.")
+    ap.add_argument("--guidance_return_waypoint_mm", type=float, default=8.0,
+                     help="2026-08-24: how close (mm) the scanner's own recent position must get "
+                          "to a tooth's real centroid to count that waypoint as reached during the "
+                          "left-sweep's return-to-center sweep (1->2->...->8, re-visiting each "
+                          "already-confirmed tooth on the way back to the midline before starting "
+                          "the right sweep). Kept separate from --guidance_center_return_threshold "
+                          "(not itself a CLI flag, hardcoded 20mm) since real teeth are only "
+                          "~8-10mm apart - a looser value lets multiple waypoints get satisfied "
+                          "from one scanner position instead of a true one-tooth-at-a-time sweep.")
+    ap.add_argument("--guidance_forward_waypoint_mm", type=float, default=8.0,
+                    help="how close the live scanner position must be to a confirmed outbound "
+                         "tooth centroid for that physical waypoint to count as reached")
+    ap.add_argument("--guidance_forward_min_progress_mm", type=float, default=4.0,
+                    help="minimum live scanner-position progress between consecutive outbound "
+                         "waypoints; prevents accumulated context advancing while stationary")
     ap.add_argument("--snapshot_every", type=int, default=1,
                      help="save a (mesh, per-face predicted labels, area_mm2, dilation gate states) .npz "
                           "every N cycles to realtime/logs/snapshots/<run_id>/ - see "
@@ -1305,7 +1541,7 @@ def main():
               "(pass --arch upper or --arch lower to enable them)")
 
     print(f"[*] loading checkpoint {args.ckpt} on {args.device}...")
-    model = PatchLitDilatedToothSegmentationNetwork.load_from_checkpoint(args.ckpt, map_location=args.device)
+    model = load_lit_model(args.ckpt, args.device)
     model.eval()
     model.to(args.device)
     segmenter = LiveSegmenter(model, args.device, num_classes=args.num_classes,
@@ -1313,7 +1549,11 @@ def main():
                                max_model_faces=args.max_faces, snapshot_dir=snapshot_dir,
                                snapshot_every=args.snapshot_every, color_mode=args.color_mode,
                                guidance_confirm_cycles=args.guidance_confirm_cycles,
-                               gum_smoothing_alpha=args.gum_smoothing_alpha)
+                               gum_smoothing_alpha=args.gum_smoothing_alpha,
+                               guidance_return_waypoint_mm=args.guidance_return_waypoint_mm,
+                               guidance_forward_waypoint_mm=args.guidance_forward_waypoint_mm,
+                               guidance_forward_min_progress_mm=
+                               args.guidance_forward_min_progress_mm)
 
     conn = Conn(args.host, args.port, args.retry)
     viewer = SegmentedViewerApp(lambda cmd: conn.send({"type": "cmd", "cmd": cmd}, b""), segmenter,

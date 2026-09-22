@@ -1,4 +1,5 @@
 #!/bin/bash
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 1
 # Lane 1/4 of the comprehensive independent-aspect ablation matrix - see
 # run_experiment_matrix_gpu0.sh for the full shared header (goal, anchor config, why 200 epochs,
 # all 11 runs across all 4 lanes, DDP-not-needed note, cost-balancing caveat). Launch all 4
@@ -9,7 +10,7 @@
 # Estimated total (dev-machine-relative): ~79h - heaviest lane (deep-transformer + whole-tooth +
 # area_thresholds-default all land here), expect this to be the slowest lane to finish.
 #
-# Run from the REPO ROOT, inside tmux/screen: bash run_experiment_matrix_gpu1.sh
+# Run from the REPO ROOT, inside tmux/screen: bash training_launch/run_experiment_matrix_gpu1.sh
 # If a run dies, resume via --ckpt <path>/last.ckpt rather than restarting.
 
 set -e

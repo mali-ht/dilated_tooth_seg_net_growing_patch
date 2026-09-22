@@ -10,7 +10,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 # this file moved from testing/realtime/ to realtime/ (one level shallower), so this now only
 # needs to strip 2 path components (file -> realtime -> root), not 3
 
-from models.patch_lightning_module import PatchLitDilatedToothSegmentationNetwork  # noqa: E402
+from realtime.mesh_viewer_segmented import load_lit_model  # noqa: E402
 from realtime.mesh_viewer_segmented import LiveSegmenter, colors_for_predictions, flat_shaded_mesh  # noqa: E402
 
 # Headless test of the actual live-inference pipeline - no Open3D window, no network, no real
@@ -53,7 +53,12 @@ def main(obj_path, ckpt_path, num_classes, device):
           f"native density={len(mesh.faces) / mesh.area:.1f} faces/mm2")
 
     print(f"\n=== loading checkpoint {ckpt_path} on {device} ===")
-    model = PatchLitDilatedToothSegmentationNetwork.load_from_checkpoint(ckpt_path, map_location=device)
+    # load_lit_model, not a hardcoded class - this test has to accept whichever of the 3 patch
+    # architectures a given .ckpt actually is, same as the live viewer does. Hardcoding
+    # PatchLitDilatedToothSegmentationNetwork here meant the whole suite refused to run against a
+    # transformer checkpoint (strict load_state_dict raises on the unexpected
+    # global_transformer_block.* keys) - i.e. it couldn't test the checkpoint being deployed.
+    model = load_lit_model(ckpt_path, device)
     model.eval()
     model.to(device)
 

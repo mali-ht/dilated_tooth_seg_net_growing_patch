@@ -1,4 +1,5 @@
 #!/bin/bash
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 1
 # Standalone script, deliberately separate from run_experiment_matrix.sh (that file is currently
 # mid-execution in another terminal on run 2 - editing a live-running bash script risks bash's
 # read-buffer desyncing when it reaches the not-yet-executed lines, so this is its own file rather
@@ -19,7 +20,7 @@
 # only replace best-epoch=84-val_miou=0.7730.ckpt if a later epoch actually beats it.
 #
 # Run from the REPO ROOT:
-#   bash run_extend_run1_200ep.sh
+#   bash training_launch/run_extend_run1_200ep.sh
 
 set -e
 set -o pipefail

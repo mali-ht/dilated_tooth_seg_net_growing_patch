@@ -1,4 +1,5 @@
 #!/bin/bash
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 1
 # RENAMED 2026-08-22 (from run_experiment_matrix.sh) - the comprehensive independent-aspect
 # ablation matrix (gating/RGB/dilation_ks/whole-tooth/color-dropout/early_bias_power/
 # area_thresholds/both Transformer architectures, 11 runs total) now targets the 4-GPU server
@@ -64,7 +65,7 @@
 #
 # Run from the REPO ROOT, inside tmux/screen (a dropped session over multiple days will otherwise
 # kill it):
-#   bash run_experiment_matrix_this_machine.sh
+#   bash training_launch/run_experiment_matrix_this_machine.sh
 # If a run dies, resume it rather than restarting - checkpoints/<experiment_version>/last.ckpt is
 # written every epoch:
 #   python3 train_patch_network_color.py <same flags as that run's CMD> --ckpt <path to last.ckpt>

@@ -1,4 +1,5 @@
 #!/bin/bash
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." || exit 1
 # ============================================================================================
 # COMPREHENSIVE INDEPENDENT-ASPECT ABLATION MATRIX - SERVER (4 GPUs), lane 0/4
 # Written 2026-08-22. This is lane 0 of 4 - see run_experiment_matrix_gpu1.sh/gpu2.sh/gpu3.sh
@@ -46,7 +47,7 @@
 # to finish since dilation_ks widening's cost is concentrated in this lane alone.
 #
 # Run from the REPO ROOT, inside tmux/screen (a dropped session over multiple days will otherwise
-# kill it): bash run_experiment_matrix_gpu0.sh
+# kill it): bash training_launch/run_experiment_matrix_gpu0.sh
 # If a run dies, resume rather than restart - checkpoints/<experiment_version>/last.ckpt is
 # written every epoch: python3 train_patch_network_color.py <same flags> --ckpt <path>
 # ============================================================================================

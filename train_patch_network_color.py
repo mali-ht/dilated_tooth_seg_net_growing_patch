@@ -38,6 +38,7 @@ from lightning.pytorch import seed_everything
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import TensorBoardLogger
 
+from dataset.patch_dataset_midline import PatchTeeth3DSDatasetWithMidlineSeed
 from dataset.patch_dataset_whole_tooth import DEFAULT_MARGIN_MM, PatchTeeth3DSDatasetWithWholeTooth
 from dataset.patch_face_cap import DEFAULT_MAX_FACES, MaxFaceCapTransform
 from dataset.patch_losses import compute_class_alpha
@@ -116,7 +117,8 @@ seed_everything(SEED, workers=True)
 
 def get_datasets(root, processed_folder, train_test_split, num_classes, early_bias_power, max_faces,
                   color_style='flat', whole_tooth_patch_prob=0.3, whole_tooth_margin_mm=DEFAULT_MARGIN_MM,
-                  color_dropout_prob=0.0):
+                  color_dropout_prob=0.0, midline_seed_prob=0.0, midline_seed_min_mm=8.0,
+                  midline_seed_max_mm=22.0, midline_seed_stages=8):
     color_transform_cls = {
         # Added 2026-08-22 for the RGB-effectiveness ablation (run_experiment_matrix.sh): the
         # plain 24-dim PatchPreTransform (dataset/patch_preprocessing.py, untouched) - no color
@@ -138,6 +140,12 @@ def get_datasets(root, processed_folder, train_test_split, num_classes, early_bi
         raise ValueError("--color_dropout_prob > 0 has no meaning with --color_style none - there's "
                           "no color channel to drop out of a 24-dim (geometry-only) feature vector.")
 
+    if midline_seed_prob > 0.0 and whole_tooth_patch_prob > 0.0:
+        raise ValueError("--midline_seed_prob > 0 and --whole_tooth_patch_prob > 0 together aren't "
+                          "supported yet - each new curriculum axis is tested in isolation first, "
+                          "same methodology as the rest of the ablation matrix (see "
+                          "dataset/patch_dataset_midline.py's own comment). Set one of them to 0.")
+
     def make_transform():
         inner = color_transform_cls(classes=num_classes)
         # 0.0 (default): unchanged from before this flag existed - no wrapper, byte-identical
@@ -146,29 +154,42 @@ def get_datasets(root, processed_folder, train_test_split, num_classes, early_bi
             inner = ColorDropoutWrapper(inner, dropout_prob=color_dropout_prob)
         return MaxFaceCapTransform(inner, max_faces=max_faces)
 
-    # PatchTeeth3DSDatasetWithWholeTooth (dataset/patch_dataset_whole_tooth.py, additive subclass -
-    # PatchTeeth3DSDataset itself untouched): at whole_tooth_patch_prob=0.0 every draw still takes
-    # the original scan-sweep growth path, just via a subclass __getitem__ that duplicates it rather
-    # than the base class's own - see that file's own docstring on why this isn't byte-identical to
-    # plain PatchTeeth3DSDataset output even at 0.0 (same distribution, different specific rng draws).
-    train = PatchTeeth3DSDatasetWithWholeTooth(
+    # PatchTeeth3DSDatasetWithWholeTooth / PatchTeeth3DSDatasetWithMidlineSeed (dataset/
+    # patch_dataset_whole_tooth.py / patch_dataset_midline.py, additive subclasses -
+    # PatchTeeth3DSDataset itself untouched): at prob=0.0 every draw still takes the original
+    # scan-sweep growth path, just via a subclass __getitem__ that duplicates it rather than the
+    # base class's own - see either file's own docstring on why this isn't byte-identical to plain
+    # PatchTeeth3DSDataset output even at 0.0 (same distribution, different specific rng draws).
+    # The two are mutually exclusive for now (guarded above) - whichever one is enabled decides
+    # dataset_cls; if neither is, whole-tooth's class is used at prob=0.0, matching this
+    # function's behavior before --midline_seed_prob existed.
+    if midline_seed_prob > 0.0:
+        dataset_cls = PatchTeeth3DSDatasetWithMidlineSeed
+        train_kwargs = dict(midline_seed_prob=midline_seed_prob, midline_seed_min_mm=midline_seed_min_mm,
+                             midline_seed_max_mm=midline_seed_max_mm, midline_seed_stages=midline_seed_stages)
+        val_kwargs = dict(midline_seed_prob=0.0, midline_seed_min_mm=midline_seed_min_mm,
+                           midline_seed_max_mm=midline_seed_max_mm, midline_seed_stages=midline_seed_stages)
+    else:
+        dataset_cls = PatchTeeth3DSDatasetWithWholeTooth
+        train_kwargs = dict(whole_tooth_patch_prob=whole_tooth_patch_prob, whole_tooth_margin_mm=whole_tooth_margin_mm)
+        val_kwargs = dict(whole_tooth_patch_prob=0.0, whole_tooth_margin_mm=whole_tooth_margin_mm)
+
+    train = dataset_cls(
         root, processed_folder=processed_folder, num_classes=num_classes,
         is_train=True, train_test_split=train_test_split, early_bias_power=early_bias_power,
-        transform=make_transform(), whole_tooth_patch_prob=whole_tooth_patch_prob,
-        whole_tooth_margin_mm=whole_tooth_margin_mm)
-    # val stays pinned to whole_tooth_patch_prob=0.0 (pure scan-sweep) REGARDLESS of the train-side
-    # knob above - the live client (realtime/mesh_viewer_segmented.py) only ever generates
-    # scan-sweep-footprint patches, never whole-tooth ones, so val_miou needs to keep measuring
+        transform=make_transform(), **train_kwargs)
+    # val stays pinned to prob=0.0 (pure scan-sweep) REGARDLESS of the train-side knob above - the
+    # live client (realtime/mesh_viewer_segmented.py) only ever generates scan-sweep-footprint
+    # patches, never whole-tooth or midline-seeded ones, so val_miou needs to keep measuring
     # performance on that same real-deployment distribution for it to stay comparable across runs
     # (e.g. against the color_baseline/color_tuned checkpoints already in checkpoints/, both pure
-    # scan-sweep). Mixing whole-tooth patches into val would answer a different question ("does the
-    # model also get better at whole-tooth patches") instead of the one that matters here (does
-    # training WITH them improve real scan-sweep performance).
-    val = PatchTeeth3DSDatasetWithWholeTooth(
+    # scan-sweep). Mixing either curriculum into val would answer a different question ("does the
+    # model also get better at whole-tooth/midline-seeded patches") instead of the one that matters
+    # here (does training WITH them improve real scan-sweep performance).
+    val = dataset_cls(
         root, processed_folder=processed_folder, num_classes=num_classes,
         is_train=False, train_test_split=train_test_split, early_bias_power=early_bias_power,
-        transform=make_transform(), whole_tooth_patch_prob=0.0,
-        whole_tooth_margin_mm=whole_tooth_margin_mm)
+        transform=make_transform(), **val_kwargs)
     return train, val
 
 
@@ -286,6 +307,35 @@ if __name__ == "__main__":
                               'use - user-decided 2026-08-19 default of 1.5mm, see '
                               'dataset/patch_generator_whole_tooth.py\'s own comment on why a pure '
                               'label-boundary mask (margin=0) is unlike anything a real scan produces')
+    parser.add_argument('--midline_seed_prob', type=float, default=0.0,
+                         help='Fraction of TRAIN draws that use the midline-seeded curriculum '
+                              '(dataset/patch_generator_midline.py: a small, symmetric footprint '
+                              'straddling the boundary between central incisors 8/9, growing '
+                              'outward from there) instead of the existing single-tooth-seeded '
+                              'scan-sweep growth. Added 2026-08-24 to address a real-hardware '
+                              'finding, first flagged 2026-08-15 and still reproducing on '
+                              '2026-08-19/21/24 runs: the live scanner\'s first captured patch is '
+                              'usually a tiny, near-even split between 8 and 9, which the '
+                              'single-tooth-seeded curriculum essentially never produces (measured: '
+                              'the other central incisor averages only ~7-8%% of a stage-0 patch). '
+                              'Mutually exclusive with --whole_tooth_patch_prob > 0 for now (see '
+                              'get_datasets()). val always uses 0.0 (pure scan-sweep) regardless of '
+                              'this flag, same rationale as --whole_tooth_patch_prob.')
+    parser.add_argument('--midline_seed_min_mm', type=float, default=8.0,
+                         help='Smallest square footprint size (mm) in the midline-seeded '
+                              "curriculum's growth sequence - empirically, this and the default "
+                              'max/stages keep stages 0-2 (~25-58mm2) as a clean {8, 9, gum} patch '
+                              'with no lateral/canine bleed, bracketing the ~54mm2 real live '
+                              'observation this curriculum targets.')
+    parser.add_argument('--midline_seed_max_mm', type=float, default=22.0,
+                         help='Largest square footprint size (mm) in the midline-seeded '
+                              "curriculum's growth sequence - by this size it's already picked up "
+                              'the lateral incisors and canines, at which point the base scan-sweep/'
+                              'whole-tooth curricula already cover the same territory.')
+    parser.add_argument('--midline_seed_stages', type=int, default=8,
+                         help='Number of growth stages between --midline_seed_min_mm and '
+                              '--midline_seed_max_mm (linearly spaced) - feeds the same '
+                              'early_bias_power-weighted stage sampler the base curriculum uses.')
     parser.add_argument('--early_bias_power', type=float, default=2.5,
                          help='How hard training patch-stage sampling skews toward small/early '
                               'stages (rng.random()**power) - default matches '
@@ -335,7 +385,9 @@ if __name__ == "__main__":
     train_dataset, val_dataset = get_datasets(args.root, args.processed_folder, args.train_test_split,
                                                args.num_classes, args.early_bias_power, args.max_faces,
                                                args.color_style, args.whole_tooth_patch_prob,
-                                               args.whole_tooth_margin_mm, args.color_dropout_prob)
+                                               args.whole_tooth_margin_mm, args.color_dropout_prob,
+                                               args.midline_seed_prob, args.midline_seed_min_mm,
+                                               args.midline_seed_max_mm, args.midline_seed_stages)
 
     class_alpha = None
     if not args.no_class_weights:

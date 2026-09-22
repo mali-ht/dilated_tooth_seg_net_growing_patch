@@ -927,6 +927,128 @@ transient model error from permanently derailing the guidance state machine. The
 still isn't reliable enough to be the robot's unsupervised primary guide; this is a mitigation on
 top of a real, unresolved accuracy gap, not a substitute for closing it.
 
+### Finding #14: left->right transition is now a full tooth-by-tooth return sweep, and a pre-existing arrow-disappears gap at the 8->9 handoff was fixed (both RESOLVED, verified against the real _compute_guidance method)
+
+User-requested 2026-08-24: instead of Finding #11's single jump straight to the 8/9 midline once
+the left sweep finishes, the target now walks BACKWARD through `_GUIDANCE_LEFT_SEQUENCE` in reverse
+(1->2->3->4->5->6->7->8), re-visiting each already-confirmed tooth's own real centroid in turn -
+deliberately re-sweeping the occlusal surface a second time on the way back rather than cutting
+straight across the arch. `self._guidance_return_reached` (sticky, like `_guidance_confirmed`)
+tracks which waypoints the scanner's own recent position has already passed within
+`--guidance_return_waypoint_mm` of.
+
+Verified directly against the real `_compute_guidance` method (not a reimplementation - loaded a
+real checkpoint into a `LiveSegmenter`, pre-seeded a synthetic 9mm-spaced 8-tooth arch as already
+confirmed, then stepped `_last_chunk_centroid` along a simulated return path) before trusting this
+on live hardware, same methodology as Findings #11/#13. Two things surfaced by that test, both
+fixed before considering this done:
+
+1. **Reusing `guidance_center_return_threshold_mm` (20mm) was too loose** - real teeth are only
+   ~8-10mm apart, so a single scanner position near tooth 1 already satisfied teeth 2 AND 3 at
+   once, skipping straight to a target of 4 instead of a genuine one-tooth-at-a-time sweep. Fixed
+   with a separate, tighter `--guidance_return_waypoint_mm` (default 8.0mm) used only for these
+   return-sweep waypoints. Re-verified: the same synthetic arch now produces a clean
+   2->3->4->5->6->7->8->9 sequence, no skips.
+2. **Pre-existing gap, not introduced by this change**: once the return sweep reaches tooth 8, the
+   target becomes 9 (the right sweep's own start) - but `_compute_guidance`'s extrapolation block
+   only looks for anchor teeth WITHIN `_GUIDANCE_RIGHT_SEQUENCE` itself, and there's nothing before
+   index 0. This fell through to `return None` (arrow disappears entirely) for however many cycles
+   it took tooth 9 to get freshly re-confirmed by real predictions - verified directly: an
+   unbridged test run returned `None` for the whole remainder after the return sweep completed.
+   Fixed by bridging across the midline: when `_GUIDANCE_RIGHT_SEQUENCE`'s own anchor search comes
+   up empty, borrow the left sweep's last two known positions (7, then 8) and extrapolate one more
+   step in the same left-to-right direction, the same formula the normal case already uses.
+   Re-verified against the synthetic arch (where tooth 9's true position was known): the bridged
+   estimate landed exactly on it, and the arrow stayed visible with zero `None` cycles through the
+   whole handoff.
+
+Not yet re-tested against real hardware - the synthetic-arch verification above tests the real
+code path's logic directly, but `_last_chunk_centroid`'s actual real-world trajectory during a
+live return sweep is what actually confirms this feels right in hand.
+
+### Finding #15: Finding #14's return sweep stalls permanently on tooth 1, pointing backwards (RESOLVED)
+
+The first real-hardware run of Finding #14's return sweep (`mesh_viewer_segmented_20260825_071536`,
+51 cycles, arch=upper, transformer/early-global checkpoint) reproduced it immediately. The left
+sweep was textbook - target walked `7->6->5->4->3->2->1` across cycles 8-39 with the distance
+shrinking sensibly into each tooth. Then:
+
+```
+cycle 48: target=1  dist= 1.7mm   confirmed=[2..11]
+cycle 49: target=1  dist=28.9mm   confirmed=[1..11]   <- label 1 finally confirmed
+cycle 50: target=1  dist=25.3mm
+cycle 51: target=1  dist=30.1mm   return_reached=[4,5]
+```
+
+The arrow flipped around and pointed ~30mm BACKWARDS, and stayed there for the rest of the run -
+the right sweep was unreachable.
+
+**Root cause: an interaction between Finding #13's confirmation delay and Finding #14's waypoint
+gating, neither wrong on its own.** Waypoints are only ever marked reached inside the
+`if target is None:` block - i.e. only once the ENTIRE left sweep is confirmed. But
+`guidance_confirm_cycles=8` means the left sweep isn't declared complete until ~8 cycles after the
+scanner physically finished it, and the scanner keeps moving during that lag. In this run the
+scanner was already back at teeth 4/5 by the time the block first ran (`return_reached=[4,5]` in
+`cycle_0051.npz` proves it got there). Waypoints 1, 2 and 3 were therefore never markable - the code
+that would have marked them didn't execute while the scanner was there, and it was 30mm away by the
+time it did. Since the returned target is always the FIRST unreached waypoint, one unmarkable
+waypoint pins the target forever.
+
+**Fix, two parts, both in `_compute_guidance`:**
+1. **One-time seed on first engagement**: start the return from whichever waypoint the scanner is
+   actually NEAREST to, not unconditionally from tooth 1. Deliberately no distance threshold - the
+   scanner is wherever it is, and pointing it back at tooth 1 is never the right answer. Gated by
+   the new `self._guidance_return_started` (kept separate from `_guidance_return_reached` being
+   non-empty, since that set is legitimately still empty on the first engaged cycle if no waypoint
+   has a centroid yet).
+2. **Monotone waypoint progress** (`_mark_return_reached`): marking waypoint k also marks every
+   earlier waypoint. Return-sweep progress is monotone along the sequence, so reaching k means
+   everything before k is behind the scanner whether or not it was individually marked. This closes
+   a second, independent way the same stall opens up: at 0.5-0.9s per cycle the scanner can move
+   well past a waypoint's 8mm ball between two consecutive position samples, so waypoints can be
+   skipped even with no confirmation lag at all.
+
+**Verified two ways, both against the real `_compute_guidance` method (not a reimplementation):**
+- **A/B replay of the real failing run.** `_save_snapshot` stores `guidance_current_pos`, which IS
+  `_last_chunk_centroid` - so together with the saved vertices/faces/pred_labels, every input
+  `_compute_guidance` needs is already on disk, and the real method can be driven cycle by cycle
+  offline. (This is strictly more than `replay_guidance.py` can do - that tool only replays
+  `update_guidance_confirmation` and reimplements the sequencing around it.) With the fix
+  monkeypatched off, the replay reproduces the bug exactly - target 1 at 28.9/25.3/30.1mm, matching
+  the live log verbatim. With it on, cycle 49 seeds from waypoint 5 (the scanner's true nearest),
+  marks 1-5, and targets tooth 6 at 12.3mm - a short forward hop. Cycles 1-48 are byte-identical
+  either way, confirming the fix is inert until the return sweep engages.
+- **Synthetic 9mm-spaced arch** for what the real run can't cover (it ended at cycle 51, mid-sweep):
+  20mm strides that overshoot most waypoint balls still advance `2->5->7->9` with no stall
+  (part 2 working); a proper tooth-by-tooth walk still produces a clean `2->3->4->5->6->7->8->9`
+  with no skipping (the fix does NOT collapse the one-tooth-at-a-time behavior Finding #14 added);
+  the 8->9 handoff keeps a valid bridged target position with no `None`/disappearing arrow; and a
+  scanner already at the midline when the sweep engages correctly skips straight to the right sweep
+  instead of backtracking.
+
+Also re-verified via the full `test_live_segmenter.py` suite - zero regressions (per-step density
+4.68-4.74/mm², dedup/overlap/cap assertions all unchanged).
+
+**Status: fixed, verified against the real data that exhibited it. NOT yet re-tested on live
+hardware** - the next run should show the arrow turning around and continuing forward through the
+return sweep at the moment the left sweep completes, instead of flipping backwards onto tooth 1.
+
+**Two pre-existing gaps surfaced while verifying this, one fixed and one still open:**
+- `test_live_segmenter.py` hardcoded `PatchLitDilatedToothSegmentationNetwork.load_from_checkpoint`,
+  so the whole suite refused to run against a transformer checkpoint (strict `load_state_dict`
+  raises on the unexpected `global_transformer_block.*` keys) - i.e. it could not test the
+  checkpoint actually being deployed. Fixed: it now uses `load_lit_model`, same as the live viewer.
+- **STILL OPEN**: the suite feeds colorless chunks, so it also can't run against any `feature_dim=27`
+  color checkpoint (`mesh_to_model_inputs_with_color` raises). Since every current best checkpoint
+  is color-trained, the suite can only be run against an older geometry-only one - which is what the
+  zero-regression check above used. Worth fixing by synthesizing plausible per-vertex color in the
+  test chunks.
+- **ALSO OPEN**: `replay_guidance.py`'s `regimen_target()` still models the pre-Finding-#14 logic
+  (no return sweep, no waypoints), so its reported transitions no longer match live behavior - on
+  this run it reports jumping straight to `RIGHT target=12` at cycle 49. The tool still correctly
+  replays `update_guidance_confirmation` (which is imported, not reimplemented); it's only its own
+  local sequencing mirror that has drifted.
+
 ## How to run it
 
 **2026-08-19: the whole realtime subsystem moved from `testing/realtime/` to a top-level
@@ -945,7 +1067,9 @@ python3 realtime/mesh_viewer_segmented.py \
 ```
 `--max_faces` defaults to 20000 (see Finding #5) - only pass it explicitly to change that cap.
 `--guidance_confirm_cycles` defaults to 8 (see Finding #13) - lower for a more responsive but
-noisier arrow, raise for a slower but more conservative one. `--color_mode {varying,flat}` and
+noisier arrow, raise for a slower but more conservative one. `--guidance_return_waypoint_mm`
+defaults to 8.0 (see Finding #14) - how close the scanner must get to each tooth on the
+left-sweep's return-to-center leg before advancing to the next one. `--color_mode {varying,flat}` and
 `--color_style {flat,mosaic}` (that second one is a *training*-time flag, not this script's) are
 covered in the color findings above. `analyze_snapshot_colors.py` and `replay_guidance.py` are
 offline tools that replay a saved run's snapshots - no live hardware needed - to check captured

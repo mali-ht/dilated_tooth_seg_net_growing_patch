@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.."
+cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 recipe=${1:?Usage: run_controlled.sh RECIPE [training arguments]}
 shift
 cmd=(python3 -u -m experiments.controlled.train --recipe "$recipe" "$@")

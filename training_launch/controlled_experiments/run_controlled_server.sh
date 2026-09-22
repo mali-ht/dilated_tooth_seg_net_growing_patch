@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Explicit foreground orchestrator: one serial lane per selected GPU.
-# Usage: bash training_launch/run_controlled_server.sh 0,1,2,3 [training arguments]
+# Usage: bash training_launch/controlled_experiments/run_controlled_server.sh 0,1,2,3 [training arguments]
 set -euo pipefail
 dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 IFS=, read -r -a devices <<< "${1:?Supply GPU IDs, e.g. 0,1,2,3}"

@@ -49,7 +49,7 @@ not bundled into this first loss/sampling comparison.
 
 ## Exactly seven new shell scripts
 
-All are in `training_launch/`; existing launchers remain available.
+All are in `training_launch/controlled_experiments/`; existing launchers remain available.
 
 1. `run_controlled_A_inverse_sweep.sh`
 2. `run_controlled_B_sqrt_sweep.sh`
@@ -183,22 +183,22 @@ measure them or substitute for real scanner color.
 ## Inspect commands before launching
 
 ```bash
-bash training_launch/run_controlled_local.sh --dry-run
-bash training_launch/run_controlled_server.sh 0,1,2,3 --dry-run
+bash training_launch/controlled_experiments/run_controlled_local.sh --dry-run
+bash training_launch/controlled_experiments/run_controlled_server.sh 0,1,2,3 --dry-run
 ```
 
 These print all four recipes, devices, manifest path and update budgets. They do
 not prepare data or start training. One individual run, when ready:
 
 ```bash
-bash training_launch/run_controlled_A_inverse_sweep.sh
+bash training_launch/controlled_experiments/run_controlled_A_inverse_sweep.sh
 ```
 
 All four locally, or all four distributed across selected server GPUs:
 
 ```bash
-bash training_launch/run_controlled_local.sh
-bash training_launch/run_controlled_server.sh 0,1,2,3 --workers 8
+bash training_launch/controlled_experiments/run_controlled_local.sh
+bash training_launch/controlled_experiments/run_controlled_server.sh 0,1,2,3 --workers 8
 ```
 
 The user launches these commands in their terminal. There is no automatic tmux,
@@ -219,7 +219,7 @@ step count are verified after successful completion.
 An interrupted epoch restarts from the last COMPLETED saved epoch. To resume A:
 
 ```bash
-bash training_launch/run_controlled_A_inverse_sweep.sh --resume
+bash training_launch/controlled_experiments/run_controlled_A_inverse_sweep.sh --resume
 ```
 
 Resume requires matching manifest, seed, full budget, validation interval, alpha
